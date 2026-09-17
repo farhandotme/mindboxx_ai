@@ -1,0 +1,39 @@
+# COMPANY INFO
+# ─────────────────────────────────────────────────────────────
+# Everything you write in this file is given to the AI as facts about
+# your company. It will use ONLY what's written here to answer any
+# question about the company — public or internal. Nothing here is
+# sent anywhere except into the AI's own instructions.
+#
+# Just replace the example content below with your real company info.
+# You can add as many sections/lines as you want — public info,
+# internal-only info, policies, contacts, whatever this AI should know.
+# Lines starting with # are comments and are ignored.
+# ─────────────────────────────────────────────────────────────
+
+Company name: Mindboxx Technologies
+About: Mindboxx is a software company that builds AI-powered productivity tools for businesses.
+Founded: 2014
+Website: www.mindboxxindia.com
+Public contact: 
+
+## Internal info (only shared with people using this assistant)
+Departments: Engineering, Product, Sales, Support
+Internal helpdesk: it-help@mindboxx.com
+Office hours: Mon–Fri, 9 AM – 6 PM
+Leave policy: Employees get 18 paid leave days per year, requested via the HR portal.
+Expense policy: Expenses under $50 can be self-approved; anything above needs manager sign-off.
+
+## Add your own sections below
+About 
+
+Assam's home-grown IT brand;
+creating a global impact
+since 2012!
+At MindBoxx India, we believe great ideas deserve flawless execution. For over 14 years, we’ve’ve been building websites, software solutions, AI-powered tools, and digital branding strategies that help businesses thrive. With 800+ satisfied clients across 25+ countries, our mission is simple — create technology that works beautifully, and works for you
+
+## Overview
+Mindboxx Technologies, founded in 2014, is a dynamic software company dedicated to building AI-powered productivity tools and digital solutions. Based on a strong foundation of innovation and client satisfaction, the company has grown into a trusted technology partner serving over 800 clients across more than 25 countries, continually striving to deliver execution that flawlessly brings great ideas to life.
+
+## Website Highlights
+The official Mindboxx Technologies website showcases over 14 years of excellence in building websites, software solutions, and digital branding strategies. Highlighting intelligence, design, and reliable systems, the company has become a trusted technology partner for over 1,800 happy customers worldwide. Their accolades include prestigious recognitions such as the Indian Achiever's Award for 'Most Emerging Company' and the Go Global Award by the International Trade Council.

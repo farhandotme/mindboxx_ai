@@ -1,0 +1,17 @@
+[project]
+name = "mark-liii-main"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Farhan Hussain", email = "princeofficial355@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+mark-liii-main = "mark_liii_main:main"
+
+[build-system]
+requires = ["uv_build>=0.12.8,<0.13.0"]
+build-backend = "uv_build"
