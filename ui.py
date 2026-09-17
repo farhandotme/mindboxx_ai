@@ -51,6 +51,11 @@ BASE_DIR   = _base_dir()
 CONFIG_DIR = BASE_DIR / "config"
 API_FILE   = CONFIG_DIR / "api_keys.json"
 
+# ── Mindboxx hero artwork ─────────────────────────────────────────────────
+# This is the authoritative brand mark. It is loaded as a real image asset
+# rather than reconstructed from particles, a font glyph, or a generated mask.
+M_IMAGE_FILE = BASE_DIR / "assets" / "mindboxx_m.png"
+
 
 def _read_full_config() -> dict:
     """Read api_keys.json config dict. Returns {} on any error."""
@@ -62,36 +67,39 @@ def _read_full_config() -> dict:
 
 _DEFAULT_W, _DEFAULT_H = 980, 700
 _MIN_W,     _MIN_H     = 820, 580
-_LEFT_W  = 192
-_RIGHT_W = 340
+_LEFT_W  = 154
+_RIGHT_W = 224
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
 
 class C:
-    # Holographic white/blue theme — cool glass-and-light palette instead of
-    # the old pure-cyan terminal look.
-    BG        = "#050a12"
-    PANEL     = "#0a1220"
-    PANEL2    = "#0c1524"
-    BORDER    = "#1c3350"
-    BORDER_B  = "#4f8fce"
-    BORDER_A  = "#2c4f78"
-    PRI       = "#eaf6ff"
-    PRI_DIM   = "#7fb2e0"
-    PRI_GHO   = "#122238"
-    ACC       = "#ff6b00"
-    ACC2      = "#ffcc00"
-    GREEN     = "#00ff88"
-    GREEN_D   = "#00aa55"
-    RED       = "#ff3355"
-    MUTED_C   = "#ff3366"
-    TEXT      = "#eaf6ff"
-    TEXT_DIM  = "#5c7fa3"
-    TEXT_MED  = "#a8cdea"
+    # Mindboxx theme — near-black glass console with a restrained orange
+    # accent, replacing the old blue holographic palette. Kept as plain hex
+    # (no alpha) since most panels consume these directly in QSS; genuine
+    # glass transparency is applied separately via rgba(...) on the sidebar
+    # frames themselves.
+    BG        = "#000000"
+    PANEL     = "#0a0a0a"
+    PANEL2    = "#0f0f0f"
+    BORDER    = "#242424"
+    BORDER_B  = "#4a4a4a"
+    BORDER_A  = "#333333"
+    PRI       = "#f5f5f5"
+    PRI_DIM   = "#9a9a9a"
+    PRI_GHO   = "#161616"
+    ACC       = "#ff8a3d"
+    ACC2      = "#ff9d5c"
+    GREEN     = "#f5f5f5"
+    GREEN_D   = "#8a8a8a"
+    RED       = "#ff8a3d"
+    MUTED_C   = "#8a8a8a"
+    TEXT      = "#f5f5f5"
+    TEXT_DIM  = "#5d5d5d"
+    TEXT_MED  = "#bdbdbd"
     WHITE     = "#ffffff"
-    DARK      = "#04080f"
-    BAR_BG    = "#0a1420"
+    DARK      = "#020202"
+    BAR_BG    = "#0a0a0a"
 
 
 # Keys tied to the accent colour — status colours (ACC, GREEN, RED…) stay fixed
@@ -120,6 +128,12 @@ def apply_ui_accent(accent_hex: str) -> bool:
     try:
         int(accent_hex[1:], 16)
     except ValueError:
+        return False
+    # Mindboxx deliberately stays monochrome with a small warm accent.
+    # Reject unrelated hues so saved customisation cannot reintroduce the
+    # former cyan/purple dashboard palette.
+    allowed = {DEFAULT_UI_COLOR.lower(), C.ACC.lower(), C.ACC2.lower()}
+    if accent_hex not in allowed:
         return False
 
     def _hsv(h: str) -> tuple[float, float, float]:
@@ -398,7 +412,7 @@ class HudCanvas(QWidget):
     # holographic orb+eyes look.
     _USE_FACE_IMAGE = False
 
-    def __init__(self, face_path: str, assistant_name: str = "J.A.R.V.I.S", parent=None):
+    def __init__(self, face_path: str, assistant_name: str = "MINDBOXX", parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
         self.setMinimumSize(300, 300)
@@ -423,21 +437,30 @@ class HudCanvas(QWidget):
         self._blink_tick = 0
         self._particles: list[list[float]] = []
         self._face_px: QPixmap | None = None
+        self._m_px: QPixmap | None = None
         # Rescaled-face cache: the smooth rescale is expensive, so we keep the
         # last result and only rebuild it when the (quantised) size changes.
         self._face_cache: QPixmap | None = None
         self._face_cache_sz = -1
+        # Cache the supplied hero PNG at device-pixel resolution so the
+        # artwork remains sharp on scaled displays.
+        self._m_cache: QPixmap | None = None
+        self._m_cache_key = None
         # Static grid-dot layer, pre-rendered once per size/theme into a pixmap
         # so paintEvent blits it in one call instead of thousands of drawPoint()s.
         self._grid_cache: QPixmap | None = None
         self._grid_key = None
-        # Starfield + planet-limb glow layer — same caching trick, gives the
-        # HUD the "space window" backdrop from the AUREX reference instead of
-        # a flat gradient. Fixed RNG seed so it's a stable field, not noise.
+        # Starfield + planet-limb glow layer — same caching trick, keeping the
+        # background atmospheric without competing with the supplied artwork.
         self._stars_cache: QPixmap | None = None
         self._stars_key = None
+        # Screen-space anchor for the small orb, calculated from the supplied
+        # artwork bounds so it stays beside the wordmark.
+        self._orb_anchor: tuple[float, float] | None = None
+        self._orb_base_r: float = 40.0
         # Repaint throttle counter (idle frames drop to ~20 Hz — see _step()).
         self._paint_tick = 0
+        self._load_mindboxx_asset()
         self._load_face(face_path)
 
         # Live audio reactivity: _live_amp is written from the audio threads
@@ -456,18 +479,8 @@ class HudCanvas(QWidget):
 
         # Static flavor-text labels floating in the HUD area (as in the
         # AUREX reference) — plain child widgets, positioned in resizeEvent.
-        self._word_list_lbl = QLabel("LISTEN\nTHINK\nUNDERSTAND\nASSIST\nEVOLVE", self)
-        self._word_list_lbl.setFont(mono_font(8, QFont.Weight.Bold))
-        self._word_list_lbl.setStyleSheet(
-            f"color: {C.TEXT_MED}; background: transparent; letter-spacing: 2px;"
-        )
-
-        self._tagline_lbl = QLabel("MORE\nTHAN\nA TOOL", self)
-        self._tagline_lbl.setFont(mono_font(8, QFont.Weight.Bold))
-        self._tagline_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-        self._tagline_lbl.setStyleSheet(
-            f"color: {C.TEXT_DIM}; background: transparent; letter-spacing: 2px;"
-        )
+        # No flavor-text labels in the hero area — the reference keeps it
+        # clean (M + wordmark + orb only, framed by the subtle HUD rings).
 
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._step)
@@ -475,11 +488,6 @@ class HudCanvas(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        W, H = self.width(), self.height()
-        self._word_list_lbl.adjustSize()
-        self._word_list_lbl.move(int(W * 0.05), int(H * 0.13))
-        self._tagline_lbl.adjustSize()
-        self._tagline_lbl.move(int(W * 0.93) - self._tagline_lbl.width(), int(H * 0.56))
 
     def set_audio_level(self, level: float) -> None:
         """Thread-safe entry point for the audio threads. Stores the louder of
@@ -523,13 +531,39 @@ class HudCanvas(QWidget):
         self._face_cache    = None
         self._face_cache_sz = -1
 
+    def _load_mindboxx_asset(self) -> None:
+        """Load the supplied transparent hero PNG once and keep it untouched."""
+        px = QPixmap(str(M_IMAGE_FILE))
+        self._m_px = px if not px.isNull() else None
+        self._m_cache = None
+        self._m_cache_key = None
+
+    # ── HiDPI-safe pixmap cache creation ────────────────────────────────────
+    # Every *_cache pixmap below (grid, stars, mindboxx mark) used to be built
+    # with plain QPixmap(W, H) at LOGICAL widget size, with no device-pixel-
+    # ratio set on it. On any scaled/HiDPI display (Windows scaling != 100%,
+    # a Retina Mac, a 4K panel at 150%) Qt then has to stretch that pixmap to
+    # cover the real physical pixel area when it's blitted — and stretching a
+    # rasterised image (rather than re-rendering it) is exactly what turns
+    # smooth antialiased dots into hard blocky squares. Building the pixmap at
+    # the true device pixel size and tagging it with setDevicePixelRatio makes
+    # Qt paint it at native resolution and composite it back down correctly,
+    # while every existing drawing call below keeps using plain logical (W,H)
+    # coordinates — nothing else about _make_grid/_make_stars needs to change.
+    def _new_cache_pixmap(self, w: int, h: int) -> QPixmap:
+        dpr = self.devicePixelRatioF() or 1.0
+        pm = QPixmap(max(1, int(w * dpr)), max(1, int(h * dpr)))
+        pm.setDevicePixelRatio(dpr)
+        pm.fill(Qt.GlobalColor.transparent)
+        return pm
+
     def _make_grid(self, W: int, H: int) -> QPixmap:
         """Pre-render the static grid-dot background into a transparent pixmap so
         paintEvent can blit it once per frame instead of running a nested
         drawPoint() loop across the whole widget every 16 ms."""
-        pm = QPixmap(max(1, W), max(1, H))
-        pm.fill(Qt.GlobalColor.transparent)
+        pm = self._new_cache_pixmap(W, H)
         gp = QPainter(pm)
+        gp.setRenderHint(QPainter.RenderHint.Antialiasing)
         gp.setPen(QPen(qcol(C.PRI_GHO), 1))
         for x in range(0, W, 48):
             for y in range(0, H, 48):
@@ -542,19 +576,19 @@ class HudCanvas(QWidget):
         as a space-station window (per the AUREX reference) instead of a flat
         gradient. Cached per size — paintEvent blits one pixmap per frame
         instead of drawing ~230 stars every 16 ms."""
-        pm = QPixmap(max(1, W), max(1, H))
-        pm.fill(Qt.GlobalColor.transparent)
+        pm = self._new_cache_pixmap(W, H)
         gp = QPainter(pm)
         gp.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        # soft curved "planet limb" glow rising from the bottom edge, echoing
-        # the Earth-curve visible behind the reference's HUD.
-        limb_cx, limb_cy = W * 0.5, H * 1.2
-        limb_r = max(W, H) * 0.95
+        # A trace of warmth low in the frame, just enough to keep the black
+        # from feeling totally flat — the reference background is almost
+        # pure black (#000/#030303/#050505), not an orange-washed void, so
+        # this stays extremely small and faint, tucked near the very bottom.
+        limb_cx, limb_cy = W * 0.5, H * 1.35
+        limb_r = max(W, H) * 0.55
         limb = QRadialGradient(QPointF(limb_cx, limb_cy), limb_r)
-        limb.setColorAt(0.0, qcol("#3a6ea5", 55))
-        limb.setColorAt(0.45, qcol("#16324f", 28))
-        limb.setColorAt(1.0, qcol("#16324f", 0))
+        limb.setColorAt(0.0, qcol(C.ACC, 7))
+        limb.setColorAt(1.0, qcol(C.ACC, 0))
         gp.setPen(Qt.PenStyle.NoPen)
         gp.setBrush(QBrush(limb))
         gp.drawEllipse(QPointF(limb_cx, limb_cy), limb_r, limb_r)
@@ -576,6 +610,197 @@ class HudCanvas(QWidget):
             glow.setColorAt(1.0, qcol(C.WHITE, 0))
             gp.setBrush(QBrush(glow))
             gp.drawEllipse(QPointF(x, y), 3.2, 3.2)
+
+        gp.end()
+        return pm
+
+    def _draw_mindboxx_art(self, p: QPainter, W: int, H: int) -> None:
+        """Draw the supplied Mindboxx artwork and its separate wordmark."""
+        if self._m_px is None:
+            self._orb_anchor = (W / 2, H / 2)
+            self._orb_base_r = min(W, H) * 0.05
+            return
+
+        dpr = self.devicePixelRatioF() or 1.0
+        aspect = self._m_px.width() / max(1, self._m_px.height())
+        target_w = W * 0.78
+        target_h = H * 0.74
+        draw_h = min(target_h, target_w / aspect)
+        draw_w = draw_h * aspect
+        x = (W - draw_w) / 2
+        y = (H - draw_h) / 2 - min(W, H) * 0.015
+        key = (round(draw_w), round(draw_h), round(dpr, 3))
+
+        if self._m_cache is None or self._m_cache_key != key:
+            self._m_cache = self._m_px.scaled(
+                max(1, round(draw_w * dpr)),
+                max(1, round(draw_h * dpr)),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self._m_cache.setDevicePixelRatio(dpr)
+            self._m_cache_key = key
+
+        p.drawPixmap(QPointF(x, y), self._m_cache)
+
+        word_font = QFont("Arial", max(12, round(draw_h * 0.085)),
+                          QFont.Weight.Light)
+        word_font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 104)
+        p.setFont(word_font)
+        word_y = y + draw_h * 0.565
+        word_left = x + draw_w * 0.235
+        p.setPen(QPen(qcol(C.PRI, 225)))
+        p.drawText(
+            QRectF(word_left, word_y - draw_h * 0.07, draw_w * 0.75,
+                   draw_h * 0.16),
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            "mindboxx",
+        )
+
+        # The orb is deliberately small and anchored to the left edge of the
+        # wordmark, matching the supplied reference composition.
+        self._orb_anchor = (x + draw_w * 0.155, word_y)
+        self._orb_base_r = draw_h * 0.05
+
+    # Legacy anchor constants are retained only for compatibility with older
+    # integrations that may introspect the canvas class; the renderer above
+    # uses the actual supplied PNG bounds.
+    _REL_ORB_CX  = 0.155
+    _REL_ORB_CY  = 0.562
+    _REL_WORD_X  = 0.235
+    _REL_WORD_Y  = 0.562
+
+    def _make_mindboxx_mark(self, W: int, H: int) -> QPixmap:
+        """Compatibility shim for callers from older integrations.
+
+        The live renderer uses ``_draw_mindboxx_art`` and the supplied PNG.
+        This method intentionally returns an empty layer instead of generating
+        a second procedural logo.
+        """
+        return self._new_cache_pixmap(W, H)
+
+        fw = min(W, H)
+        cx, cy = W / 2, H / 2
+
+        mask = None
+        if mask is None:
+            gp.end()
+            return self._make_mindboxx_mark_fallback(W, H)
+
+        aspect = mask["aspect"]        # reference m's true width / height
+        pts    = mask["points"]
+
+        # Fit the m inside a box that's at most ~62% of each hero dimension
+        # (within the reference's 55-70% target) while preserving its real
+        # aspect ratio — never stretched to fill a square glyph box.
+        box_w, box_h = W * 0.62, H * 0.62
+        grh = min(box_h, box_w / aspect)
+        grw = grh * aspect
+        grx0 = cx - grw / 2
+        gry0 = cy - grh / 2 - fw * 0.02
+
+        rnd = random.Random(7)
+        gp.setPen(Qt.PenStyle.NoPen)
+        base_dot = grh * 0.0075
+        for nx, ny, rf, bf in pts:
+            px = grx0 + nx * grw
+            py = gry0 + ny * grh
+            r  = max(0.6, base_dot * (0.55 + rf * 0.7) + rnd.uniform(-0.15, 0.15))
+            a  = max(40, min(235, int(70 + bf * 165)))
+            gp.setBrush(QBrush(qcol(C.PRI, a)))
+            gp.drawEllipse(QPointF(px, py), r, r)
+
+        # a few soft stray particles escaping the silhouette — atmosphere,
+        # not a second layer competing with it.
+        for _ in range(16):
+            i = rnd.randrange(len(pts))
+            nx, ny, _, _ = pts[i]
+            px = grx0 + nx * grw + rnd.uniform(-grh * 0.05, grh * 0.05)
+            py = gry0 + ny * grh + rnd.uniform(-grh * 0.05, grh * 0.05)
+            gp.setBrush(QBrush(qcol(C.PRI, rnd.randint(15, 50))))
+            gp.drawEllipse(QPointF(px, py), rnd.uniform(0.5, 1.0), rnd.uniform(0.5, 1.0))
+
+        # "mindboxx" wordmark, anchored at the reference's own position.
+        word_font = QFont("Arial", max(11, int(grh * 0.082)), QFont.Weight.Light)
+        word_font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 104)
+        gp.setFont(word_font)
+        word_y    = gry0 + grh * self._REL_WORD_Y
+        word_left = grx0 + grw * self._REL_WORD_X
+        word_rect = QRectF(word_left, word_y - grh * 0.07, grw * 0.75, grh * 0.16)
+        gp.setPen(QPen(qcol(C.PRI, 220)))
+        gp.drawText(word_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                    "mindboxx")
+
+        # Orb anchor + reference-proportioned base radius (diameter ≈ 10%
+        # of the m's height, within the reference's 8-13% band).
+        self._orb_anchor  = (grx0 + grw * self._REL_ORB_CX, gry0 + grh * self._REL_ORB_CY)
+        self._orb_base_r  = grh * 0.05
+
+        gp.end()
+        return pm
+
+    def _make_mindboxx_mark_fallback(self, W: int, H: int) -> QPixmap:
+        """Compatibility shim retained for older integrations."""
+        return self._new_cache_pixmap(W, H)
+
+        fw = min(W, H)
+        cx, cy = W / 2, H / 2
+
+        glyph_h = fw * 0.60
+        font = QFont("Arial", 300, QFont.Weight.Black)
+        font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+        path0 = QPainterPath()
+        path0.addText(0, 0, font, "m")
+        rect0 = path0.boundingRect()
+        if rect0.height() <= 0 or rect0.width() <= 0:
+            gp.end()
+            return pm
+
+        s = glyph_h / rect0.height()
+        target_w = rect0.width() * s
+        left_x = cx - target_w / 2
+        top_y  = cy - glyph_h / 2 - fw * 0.03
+        offset_x = left_x - rect0.x() * s
+        offset_y = top_y - rect0.y() * s
+        from PyQt6.QtGui import QTransform
+        transform = QTransform(s, 0, 0, s, offset_x, offset_y)
+        path = transform.map(path0)
+        gr = path.boundingRect()
+
+        step = max(2, fw * 0.007)
+        rnd = random.Random(42)
+        x0, y0 = gr.x(), gr.y()
+        x1, y1 = gr.x() + gr.width(), gr.y() + gr.height()
+        gp.setPen(Qt.PenStyle.NoPen)
+        y = y0
+        while y <= y1:
+            x = x0
+            while x <= x1:
+                jx = x + rnd.uniform(-step * 0.3, step * 0.3)
+                jy = y + rnd.uniform(-step * 0.3, step * 0.3)
+                if path.contains(QPointF(jx, jy)):
+                    depth = max(0.0, 1.0 - ((jx - x0) / max(1.0, gr.width())
+                                             + (jy - y0) / max(1.0, gr.height())) / 2)
+                    r = rnd.uniform(0.7, 1.4)
+                    a = int(100 + depth * 130 + rnd.uniform(-15, 15))
+                    a = max(40, min(235, a))
+                    gp.setBrush(QBrush(qcol(C.PRI, a)))
+                    gp.drawEllipse(QPointF(jx, jy), r, r)
+                x += step
+            y += step
+
+        word_font = QFont("Arial", max(14, int(fw * 0.05)), QFont.Weight.Light)
+        word_font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 102)
+        gp.setFont(word_font)
+        word_y = gr.y() + gr.height() * 0.60
+        word_left = cx - fw * 0.055
+        word_rect = QRectF(word_left, word_y - fw * 0.05, fw * 0.5, fw * 0.11)
+        gp.setPen(QPen(qcol(C.PRI, 235)))
+        gp.drawText(word_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                    "mindboxx")
+
+        self._orb_anchor = (word_left - fw * 0.035, word_y)
+        self._orb_base_r = fw * 0.05
 
         gp.end()
         return pm
@@ -681,11 +906,12 @@ class HudCanvas(QWidget):
         cx, cy = W / 2, H / 2
         fw = min(W, H)
 
-        # moody radial "space window" wash instead of a flat fill
+        # near-black radial wash instead of a flat fill — a barely-there lift
+        # toward the center so the hero area doesn't look like a dead void.
         bg_grad = QRadialGradient(QPointF(cx, cy * 0.9), fw * 1.35)
-        bg_grad.setColorAt(0.0, qcol("#0b1a2c"))
-        bg_grad.setColorAt(0.55, qcol(C.BG))
-        bg_grad.setColorAt(1.0, qcol("#02050a"))
+        bg_grad.setColorAt(0.0, qcol("#030303"))
+        bg_grad.setColorAt(0.5, qcol(C.BG))
+        bg_grad.setColorAt(1.0, qcol("#000000"))
         p.fillRect(self.rect(), QBrush(bg_grad))
 
         # starfield + planet-limb glow — blitted from a cached layer, rebuilt
@@ -706,115 +932,23 @@ class HudCanvas(QWidget):
 
         r_face = fw * 0.31
 
-        # halo glow
-        for i in range(10):
-            r   = r_face * (1.8 - i * 0.08)
-            frc = 1.0 - i / 10
-            a   = max(0, min(255, int(self._halo * 0.085 * frc)))
-            col = qcol(C.MUTED_C if self.muted else C.PRI, a)
-            p.setPen(QPen(col, 1.5)); p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(QRectF(cx - r, cy - r, r * 2, r * 2))
-
-        # pulse rings
-        for pr in self._pulses:
-            a   = max(0, int(230 * (1.0 - pr / (fw * 0.74))))
-            col = qcol(C.MUTED_C if self.muted else C.PRI, a)
-            p.setPen(QPen(col, 1.5)); p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(QRectF(cx - pr, cy - pr, pr * 2, pr * 2))
-
-        # spinning arc rings
-        for idx, (r_frac, w_r, arc_l, gap) in enumerate(
-            [(0.48, 3, 115, 78), (0.40, 2, 78, 55), (0.32, 1, 56, 40)]
-        ):
+        # Two barely-visible concentric orbital paths framing the M — per
+        # the reference, these read as almost-invisible technical framing,
+        # never as a dashboard/reactor ring. No arcs, no tick marks, no
+        # orbiting badge icons over the artwork — the reference hero area
+        # contains only the M, the wordmark and the small orb.
+        for r_frac, base_a in ((0.46, 10), (0.365, 7)):
             ring_r = fw * r_frac
-            base   = self._rings[idx]
-            a_val  = max(0, min(255, int(self._halo * (1.0 - idx * 0.18))))
-            col    = qcol(C.MUTED_C if self.muted else C.PRI, a_val)
-            p.setPen(QPen(col, w_r)); p.setBrush(Qt.BrushStyle.NoBrush)
-            angle = base
-            rect  = QRectF(cx - ring_r, cy - ring_r, ring_r * 2, ring_r * 2)
-            while angle < base + 360:
-                p.drawArc(rect, int(angle * 16), int(arc_l * 16))
-                angle += arc_l + gap
+            p.setPen(QPen(qcol(C.PRI, base_a), 1))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QRectF(cx - ring_r, cy - ring_r, ring_r * 2, ring_r * 2))
 
-        # scanners
-        sr = fw * 0.50
-        sa = min(255, int(self._halo * 1.5))
-        ex = 75 if self.speaking else 44
-        p.setPen(QPen(qcol(C.MUTED_C if self.muted else C.PRI, sa), 2.5))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        srect = QRectF(cx - sr, cy - sr, sr * 2, sr * 2)
-        p.drawArc(srect, int(self._scan * 16), int(ex * 16))
-        p.setPen(QPen(qcol(C.ACC, sa // 2), 1.5))
-        p.drawArc(srect, int(self._scan2 * 16), int(ex * 16))
+        # The supplied transparent PNG is the hero. It is scaled once per
+        # layout size and then blitted unchanged on every animation frame.
+        self._draw_mindboxx_art(p, W, H)
 
-        # tick marks
-        t_out, t_in = fw * 0.497, fw * 0.474
-        p.setPen(QPen(qcol(C.PRI, 140), 1))
-        for deg in range(0, 360, 10):
-            rad = math.radians(deg)
-            inn = t_in if deg % 30 == 0 else t_in + 6
-            p.drawLine(
-                QPointF(cx + t_out * math.cos(rad), cy - t_out * math.sin(rad)),
-                QPointF(cx + inn  * math.cos(rad), cy - inn  * math.sin(rad)),
-            )
-
-        # crosshair
-        ch_r, gap_h = fw * 0.51, fw * 0.16
-        p.setPen(QPen(qcol(C.PRI, int(self._halo * 0.5)), 1))
-        p.drawLine(QPointF(cx - ch_r, cy), QPointF(cx - gap_h, cy))
-        p.drawLine(QPointF(cx + gap_h, cy), QPointF(cx + ch_r, cy))
-        p.drawLine(QPointF(cx, cy - ch_r), QPointF(cx, cy - gap_h))
-        p.drawLine(QPointF(cx, cy + gap_h), QPointF(cx, cy + ch_r))
-
-        # decorative orbiting "planets" — purely cosmetic, independent of the
-        # live integration-ring badges, echoing the AUREX reference art. Each
-        # entry is (start_angle, radius_fraction, size, alpha, has_ring) — a
-        # couple carry a thin tilted ring, like the reference's moons.
-        for ang0, r_frac, sz, alpha, has_ring in (
-            (-35, 0.31, 7, 235, True),  (25, 0.415, 4, 150, False),
-            (200, 0.30, 5, 190, False), (150, 0.425, 3, 130, True),
-            (78,  0.46, 3, 110, False),
-        ):
-            ang = math.radians(ang0 + self._ring_angle * 0.4)
-            r   = fw * r_frac
-            x, y = cx + r * math.cos(ang), cy - r * math.sin(ang)
-
-            # soft outer bloom
-            halo = QRadialGradient(QPointF(x, y), sz * 2.6)
-            halo.setColorAt(0.0, qcol(C.PRI, int(alpha * 0.5)))
-            halo.setColorAt(1.0, qcol(C.PRI, 0))
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(halo))
-            p.drawEllipse(QPointF(x, y), sz * 2.6, sz * 2.6)
-
-            if has_ring:
-                p.save()
-                p.translate(x, y)
-                p.rotate(ang0 * 0.6)
-                p.setPen(QPen(qcol(C.TEXT_MED, int(alpha * 0.55)), max(0.6, sz * 0.09)))
-                p.setBrush(Qt.BrushStyle.NoBrush)
-                p.drawEllipse(QRectF(-sz * 2.1, -sz * 0.55, sz * 4.2, sz * 1.1))
-                p.restore()
-
-            # lit sphere body — bright upper-left highlight fading to a dim limb,
-            # instead of a flat glow blob.
-            body = QRadialGradient(QPointF(x - sz * 0.35, y - sz * 0.4), sz * 1.35)
-            body.setColorAt(0.0, qcol(C.WHITE, min(255, alpha + 20)))
-            body.setColorAt(0.55, qcol(C.PRI, alpha))
-            body.setColorAt(1.0, qcol(C.PRI_DIM, int(alpha * 0.5)))
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(body))
-            p.drawEllipse(QPointF(x, y), sz, sz)
-
-        # (corner brackets removed — the AUREX reference keeps the ring clean)
-
-        # integration ring — orbiting badges for live subsystems/plugins
-        self._draw_ring(p, cx, cy, fw)
-
-        # face — the holographic orb with minimal glowing "dash" eyes is now
-        # the primary look (matches the reference design); the loaded face
-        # image, if any, is only used when explicitly re-enabled.
+        # face — the loaded face image, if any, is only used when explicitly
+        # re-enabled; the default look is the small Mindboxx orb.
         if self._USE_FACE_IMAGE and self._face_px:
             fsz = int(fw * 0.62 * self._scale)
             # Quantise the target size so the expensive smooth rescale only runs
@@ -831,45 +965,54 @@ class HudCanvas(QWidget):
             p.drawPixmap(int(cx - scaled.width() / 2),
                          int(cy - scaled.height() / 2), scaled)
         else:
-            # Glassy holographic sphere with minimal glowing "dash" eyes.
-            orb_r = fw * 0.27 * self._scale
+            # Mindboxx orb: SMALL premium white→orange gradient sphere,
+            # anchored beside the wordmark rather than centered over the M.
+            # Sized as a fraction of the hero canvas (not the old fw*0.27
+            # giant sphere) so the M and wordmark stay the dominant visual.
+            ox, oy = self._orb_anchor if self._orb_anchor else (cx, cy)
+            base_r = getattr(self, "_orb_base_r", fw * 0.05)
+            orb_r = base_r * self._scale
             muted_tint = self.muted
-            core_col   = (255, 90, 110) if muted_tint else (170, 220, 255)
 
-            # soft radial glass fill
-            grad = QRadialGradient(QPointF(cx - orb_r * 0.3, cy - orb_r * 0.35), orb_r * 1.3)
-            grad.setColorAt(0.0, QColor(*core_col, 90))
-            grad.setColorAt(0.55, QColor(*core_col, 35))
-            grad.setColorAt(1.0, QColor(*core_col, 0))
+            if muted_tint:
+                bloom_col, halo_col, mid_col, inner_col = (
+                    (90, 90, 90), (70, 70, 70), (140, 140, 140), (215, 215, 215))
+            else:
+                bloom_col, halo_col, mid_col, inner_col = (
+                    (255, 138, 61), (255, 138, 61), (255, 180, 127), (255, 245, 237))
+
+            # very soft external bloom — restrained, not a giant aura
+            bloom_r = orb_r * 1.7
+            bloom = QRadialGradient(QPointF(ox, oy), bloom_r)
+            bloom.setColorAt(0.0, QColor(*bloom_col, min(48, int(self._halo * 0.26))))
+            bloom.setColorAt(1.0, QColor(*bloom_col, 0))
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(grad))
-            p.drawEllipse(QRectF(cx - orb_r, cy - orb_r, orb_r * 2, orb_r * 2))
+            p.setBrush(QBrush(bloom))
+            p.drawEllipse(QPointF(ox, oy), bloom_r, bloom_r)
 
-            # thin glassy rim — always clearly visible, brightens with halo
-            rim_a = max(140, min(255, int(self._halo * 2.2)))
-            p.setPen(QPen(qcol(C.PRI if not muted_tint else C.MUTED_C, rim_a), 1.5))
+            # thin translucent halo
+            halo_r = orb_r * 1.4
+            halo = QRadialGradient(QPointF(ox, oy), halo_r)
+            halo.setColorAt(0.0, QColor(*halo_col, 0))
+            halo.setColorAt(0.78, QColor(*halo_col, min(120, int(self._halo * 1.1))))
+            halo.setColorAt(1.0, QColor(*halo_col, 0))
+            p.setBrush(QBrush(halo))
+            p.drawEllipse(QPointF(ox, oy), halo_r, halo_r)
+
+            # core body — white-hot center fading through peach/orange to the edge
+            body = QRadialGradient(QPointF(ox - orb_r * 0.22, oy - orb_r * 0.28), orb_r * 1.05)
+            body.setColorAt(0.0, QColor(*inner_col, 255))
+            body.setColorAt(0.35, QColor(*inner_col, 255))
+            body.setColorAt(0.65, QColor(*mid_col, 250))
+            body.setColorAt(1.0, QColor(*bloom_col, 235))
+            p.setBrush(QBrush(body))
+            p.drawEllipse(QPointF(ox, oy), orb_r, orb_r)
+
+            # thin bright rim
+            rim_a = max(120, min(255, int(self._halo * 1.6)))
+            p.setPen(QPen(qcol(C.WHITE, rim_a), 1.0))
             p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(QRectF(cx - orb_r, cy - orb_r, orb_r * 2, orb_r * 2))
-
-            # AUREX-style chevron mark at the core, in place of "eyes".
-            chev_tint = C.MUTED_C if muted_tint else C.PRI
-            chev_w  = orb_r * 0.64
-            chev_h  = orb_r * 0.44
-            chev_th = max(3.0, orb_r * 0.12)
-
-            path = QPainterPath()
-            path.moveTo(cx - chev_w / 2, cy + chev_h / 2)
-            path.lineTo(cx, cy - chev_h / 2)
-            path.lineTo(cx + chev_w / 2, cy + chev_h / 2)
-
-            # soft glow behind the mark
-            p.setPen(QPen(qcol(chev_tint, 90), chev_th * 2.4,
-                          Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-            p.drawPath(path)
-            # crisp bright core stroke
-            p.setPen(QPen(qcol(chev_tint, 250), chev_th,
-                          Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-            p.drawPath(path)
+            p.drawEllipse(QPointF(ox, oy), orb_r, orb_r)
 
         # particles
         for pt in self._particles:
@@ -937,6 +1080,49 @@ class HudCanvas(QWidget):
                        Qt.AlignmentFlag.AlignCenter, badge.get("icon", "?"))
 
 
+class AudioWaveform(QWidget):
+    """Small deterministic waveform driven by the live smoothed audio level."""
+
+    def __init__(self, mirrored: bool = False, parent=None):
+        super().__init__(parent)
+        self._level = 0.0
+        self._active = False
+        self._mirrored = mirrored
+        self.setMinimumWidth(80)
+        self.setMinimumHeight(42)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding,
+                           QSizePolicy.Policy.Fixed)
+
+    def set_level(self, level: float, active: bool = False) -> None:
+        self._level = max(0.0, min(1.0, float(level)))
+        self._active = active
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        if not p.isActive():
+            return
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        count = 27
+        center = H / 2
+        gap = max(2.0, W / 220.0)
+        bar_w = max(1.0, (W - gap * (count - 1)) / count)
+        for i in range(count):
+            phase = i / max(1, count - 1)
+            envelope = 0.25 + 0.75 * math.sin(math.pi * phase)
+            shape = 0.56 + 0.44 * math.sin(i * 1.63 + 0.35)
+            height = 2.0 + (H * 0.42 * envelope * shape *
+                            (self._level if self._active else 0.12))
+            x = i * (bar_w + gap)
+            y = center - height / 2
+            col = C.ACC if self._active and self._level > 0.35 and i % 7 == 0 else C.PRI_DIM
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(qcol(col, 210 if self._active else 130)))
+            p.drawRoundedRect(QRectF(x, y, bar_w, height), bar_w / 2, bar_w / 2)
+        p.end()
+
+
 class MetricBar(QWidget):
     """Glass status card: icon badge + label + status word + thin % bar —
     the AUREX CORE/SIGNAL/LINK/STATE look. Keeps the original set_value(pct,
@@ -979,12 +1165,11 @@ class MetricBar(QWidget):
         p.setPen(QPen(qcol(C.BORDER_A), 1))
         p.drawRoundedRect(QRectF(1, 1, W - 2, H - 2), 10, 10)
 
-        if self._value > 85:
-            bar_col = qcol(C.RED)
-        elif self._value > 65:
-            bar_col = qcol(C.ACC)
-        else:
-            bar_col = qcol(self._color)
+        # Bar colour follows the card's own identity colour (white/gray for
+        # CORE·SIGNAL·LINK, orange for STATE) per the reference — not the
+        # live value, so a busy SIGNAL or full LINK bar never flashes
+        # warning colours the reference doesn't show.
+        bar_col = qcol(self._color)
 
         # icon badge
         icon_r = 13.0
@@ -1073,7 +1258,7 @@ class LogWidget(QTextEdit):
         self._pos     = 0
         self._tag     = "sys"
         self._hdr_len: int | None = None
-        self._ai_name_lc = "AUREX"   # updated when assistant name changes
+        self._ai_name_lc = "mindboxx"   # updated when assistant name changes
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._step)
         self._sig.connect(self._enqueue)
@@ -1120,7 +1305,7 @@ class LogWidget(QTextEdit):
         _ai_pfx = f"{self._ai_name_lc}:"
         if   self._hdr_len is not None:                           self._tag = "stream"
         elif tl.startswith("you:"):                               self._tag = "you"
-        elif tl.startswith(_ai_pfx) or tl.startswith("AUREX:"):  self._tag = "ai"
+        elif tl.startswith(_ai_pfx) or tl.startswith("MINDBOXX:"):  self._tag = "ai"
         elif tl.startswith("file:"):                               self._tag = "file"
         elif "err" in tl:                                          self._tag = "err"
         else:                                                      self._tag = "sys"
@@ -1162,12 +1347,12 @@ class LogWidget(QTextEdit):
             QTimer.singleShot(20, self._next)
 
 _FILE_ICONS = {
-    "image":   ("🖼", "#00d4ff"), "video":   ("🎬", "#ff6b00"),
-    "audio":   ("🎵", "#cc44ff"), "pdf":     ("📄", "#ff4444"),
-    "word":    ("📝", "#4488ff"), "excel":   ("📊", "#44bb44"),
-    "code":    ("💻", "#ffcc00"), "archive": ("📦", "#ff8844"),
-    "pptx":    ("📊", "#ff6622"), "text":    ("📃", "#aaaaaa"),
-    "data":    ("🔧", "#88ddff"), "unknown": ("📎", "#888888"),
+    "image":   ("IMG", "#f5f5f5"), "video":   ("VID", "#ff8a3d"),
+    "audio":   ("AUD", "#bdbdbd"), "pdf":     ("PDF", "#ff8a3d"),
+    "word":    ("DOC", "#d0d0d0"), "excel":   ("DATA", "#bdbdbd"),
+    "code":    ("CODE", "#ff9d5c"), "archive": ("ZIP", "#bdbdbd"),
+    "pptx":    ("SLIDE", "#ff9d5c"), "text":    ("TXT", "#aaaaaa"),
+    "data":    ("DATA", "#d0d0d0"), "unknown": ("FILE", "#888888"),
 }
 _EXT_TO_CAT = {
     **dict.fromkeys(["jpg","jpeg","png","gif","webp","bmp","tiff","svg","ico"], "image"),
@@ -1260,7 +1445,7 @@ class FileDropZone(QWidget):
 
     def _browse(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select a file for AUREX", str(Path.home()),
+            self, "Select a file for Mindboxx", str(Path.home()),
             "All Files (*.*);;"
             "Images (*.jpg *.jpeg *.png *.gif *.webp *.bmp *.svg);;"
             "Documents (*.pdf *.docx *.txt *.md *.pptx);;"
@@ -1295,9 +1480,9 @@ class _DropCanvas(QWidget):
         rect = QRectF(pad, pad, W - pad * 2, H - pad * 2)
 
         if z._drag_over:
-            bg_top, bg_bot = "#0f2a3d", "#0a1c2c"
+            bg_top, bg_bot = "#1a1511", "#0d0b09"
         elif z._hovering:
-            bg_top, bg_bot = "#0c1f30", "#081522"
+            bg_top, bg_bot = "#141210", "#090807"
         else:
             bg_top, bg_bot = C.PANEL2, C.PANEL
         grad = QLinearGradient(rect.topLeft(), rect.bottomLeft())
@@ -1494,7 +1679,7 @@ class SetupOverlay(QWidget):
             return w
 
         layout.addWidget(_lbl("◈  INITIALISATION REQUIRED", 13, True))
-        layout.addWidget(_lbl("Configure J.A.R.V.I.S. before first boot.", 9, color=C.PRI_DIM))
+        layout.addWidget(_lbl("Configure Mindboxx before first boot.", 9, color=C.PRI_DIM))
         layout.addSpacing(6)
 
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
@@ -1690,7 +1875,7 @@ class CustomizeOverlay(QWidget):
     saved = pyqtSignal(str, str, str, str)   # assistant_name, user_name, ui_color, voice
     _OW, _OH = 400, 588
 
-    def __init__(self, assistant_name="AUREX", user_name="",
+    def __init__(self, assistant_name="MINDBOXX", user_name="",
                  ui_color=DEFAULT_UI_COLOR, voice="", parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
@@ -1796,7 +1981,7 @@ class CustomizeOverlay(QWidget):
         self._wheel.hue_committed.connect(self._on_wheel_commit)
 
         self._hex_input = QLineEdit(self._sel_color)
-        self._hex_input.setPlaceholderText("#00d4ff   (custom hex colour)")
+        self._hex_input.setPlaceholderText("#f5f5f5   (white or warm accent)")
         self._hex_input.setFont(mono_font(10))
         self._hex_input.setFixedHeight(28)
         self._hex_input.setStyleSheet(_fs)
@@ -1896,7 +2081,7 @@ class CustomizeOverlay(QWidget):
         self.hide()
 
     def _save(self):
-        name = self._name_input.text().strip() or "AUREX"
+        name = self._name_input.text().strip() or "MINDBOXX"
         user = self._user_input.text().strip()
         self.saved.emit(name, user, self._sel_color or DEFAULT_UI_COLOR, self._sel_voice)
         self.hide()
@@ -1991,10 +2176,10 @@ class PluginManagerOverlay(QWidget):
             btn.setText("ON")
             btn.setStyleSheet(f"""
                 QPushButton {{
-                    background: #001a08; color: {C.GREEN};
+                    background: #141414; color: {C.GREEN};
                     border: 1px solid {C.GREEN_D}; border-radius: 3px;
                 }}
-                QPushButton:hover {{ background: #002010; }}
+                QPushButton:hover {{ background: #1c1c1c; }}
             """)
         else:
             btn.setText("OFF")
@@ -2339,7 +2524,7 @@ class MemoryOverlay(_HudOverlay):
 
         from memory.memory_manager import all_entries_for_ui
 
-        hdr = QLabel("🧠  WHAT AUREX REMEMBERS")
+        hdr = QLabel("🧠  WHAT MINDBOXX REMEMBERS")
         hdr.setFont(mono_font(12, QFont.Weight.Bold))
         hdr.setStyleSheet(f"color: {C.PRI}; background: transparent;")
         self._lay.addWidget(hdr)
@@ -2973,7 +3158,7 @@ class RemoteKeyOverlay(QWidget):
         self._qr_label.setStyleSheet(
             "color: #00ff88; background: #001a0d; border-radius: 10px;"
         )
-        self._timer_lbl.setText("Phone connected — AUREX ready")
+        self._timer_lbl.setText("Phone connected — MINDBOXX ready")
         self._timer_lbl.setStyleSheet(f"color: {C.GREEN}; background: transparent;")
 
     def _refresh_key(self):
@@ -3011,28 +3196,24 @@ class RemoteKeyOverlay(QWidget):
 
 
 class _WordmarkFrame(QWidget):
-    """Chamfered hexagonal frame behind the header wordmark, echoing the
-    angular notch cut into the AUREX reference's header bar."""
+    """Thin chamfered bracket around the header wordmark — a pair of angled
+    orange accent lines (no fill), echoing the Mindboxx reference's header
+    notch instead of a filled hex panel."""
 
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
-        cut = min(20, h * 0.4)
-        path = QPainterPath()
-        path.moveTo(cut, 0)
-        path.lineTo(w - cut, 0)
-        path.lineTo(w, h * 0.5)
-        path.lineTo(w - cut, h)
-        path.lineTo(cut, h)
-        path.lineTo(0, h * 0.5)
-        path.closeSubpath()
-        grad = QLinearGradient(0, 0, 0, h)
-        grad.setColorAt(0.0, qcol(C.PRI_GHO, 120))
-        grad.setColorAt(1.0, qcol(C.PRI_GHO, 35))
-        p.setBrush(QBrush(grad))
-        p.setPen(QPen(qcol(C.BORDER_B, 190), 1.2))
-        p.drawPath(path)
+        cut = min(26, h * 0.55)
+        pen = QPen(qcol(C.ACC, 170), 1.2)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        # left bracket: down-diagonal from the top edge, then flat along the bottom
+        p.drawLine(QPointF(0, 0), QPointF(cut, h * 0.5))
+        p.drawLine(QPointF(cut, h * 0.5), QPointF(0, h))
+        # right bracket, mirrored
+        p.drawLine(QPointF(w, 0), QPointF(w - cut, h * 0.5))
+        p.drawLine(QPointF(w - cut, h * 0.5), QPointF(w, h))
         p.end()
 
 
@@ -3055,7 +3236,10 @@ class MainWindow(QMainWindow):
 
         # Load customization from config
         _cfg = _read_full_config()
-        self._assistant_name: str = (_cfg.get("assistant_name") or "AUREX").strip()
+        _saved_name = (_cfg.get("assistant_name") or "").strip()
+        if _saved_name.upper() in {"AUREX", "J.A.R.V.I.S", "JARVIS"}:
+            _saved_name = "MINDBOXX"
+        self._assistant_name: str = _saved_name or "MINDBOXX"
         _display = self._assistant_name.upper()
 
         # Apply the saved UI colour BEFORE panels/stylesheets are built
@@ -3075,7 +3259,7 @@ class MainWindow(QMainWindow):
 
         self.on_text_command   = None
         self.on_remote_clicked = None   # callable: () -> (url, key) | None
-        self.on_interrupt      = None   # callable: () -> None — stop AUREX mid-speech
+        self.on_interrupt      = None   # callable: () -> None — stop MINDBOXX mid-speech
         self.on_voice_change   = None   # callable: () -> None — rebuild session with new voice
         self.on_audio_device_change = None  # callable: () -> None — reopen audio streams
         self._confirm_overlay  = None   # live ConfirmBanner, if one is on screen
@@ -3120,7 +3304,7 @@ class MainWindow(QMainWindow):
 
         # Live camera container — replaces HUD when camera stream is active
         _cam_cont = QWidget()
-        _cam_cont.setStyleSheet("background: #000308;")
+        _cam_cont.setStyleSheet("background: #000000;")
         _cam_v = QVBoxLayout(_cam_cont)
         _cam_v.setContentsMargins(0, 0, 0, 0)
         _cam_v.setSpacing(0)
@@ -3239,7 +3423,7 @@ class MainWindow(QMainWindow):
         pw = _CameraPreview._W
         ph = self._cam_preview.height()
         self._cam_preview.setGeometry(
-            cw.width() - _RIGHT_W - pw - 12,
+            cw.width() - self._right_panel.width() - pw - 12,
             cw.height() - ph - 28,
             pw, ph,
         )
@@ -3380,7 +3564,7 @@ class MainWindow(QMainWindow):
                       outline=(*CYAN, 255), width=max(2, lw))
 
             # ── bright glow soft blur applied before core ─────────────────
-            # (draw a slightly larger cyan circle on a separate layer)
+            # (draw a slightly larger warm accent circle on a separate layer)
             glow_layer = PIL.Image.new("RGBA", (S, S), (0, 0, 0, 0))
             gd = PIL.ImageDraw.Draw(glow_layer)
             Rc = int(R * 0.13)
@@ -3426,7 +3610,7 @@ class MainWindow(QMainWindow):
             sc.TargetPath       = target
             sc.Arguments        = f'"{args}"'
             sc.WorkingDirectory = work_dir
-            sc.Description      = "J.A.R.V.I.S AI Assistant"
+            sc.Description      = "MINDBOXX AI Assistant"
             sc.IconLocation     = icon_loc
             sc.save()
             return
@@ -3441,7 +3625,7 @@ class MainWindow(QMainWindow):
             f'sc.TargetPath = "{target}"',
             f'sc.Arguments = Chr(34) & "{args}" & Chr(34)',
             f'sc.WorkingDirectory = "{work_dir}"',
-            'sc.Description = "J.A.R.V.I.S AI Assistant"',
+            'sc.Description = "MINDBOXX AI Assistant"',
             f'sc.IconLocation = "{icon_loc}"',
             'sc.Save',
         ])
@@ -3553,7 +3737,7 @@ class MainWindow(QMainWindow):
         desktop = self._get_desktop_dir()
 
         # Arc-reactor icon (.ico — also exported as .png for Linux/macOS)
-        ico_path = Path(__file__).resolve().parent / "config" / "AUREX.ico"
+        ico_path = Path(__file__).resolve().parent / "config" / "MINDBOXX.ico"
         if not ico_path.exists():
             self._build_AUREX_icon(ico_path)
 
@@ -3564,14 +3748,14 @@ class MainWindow(QMainWindow):
             if _os == "Windows":
                 pythonw  = python.parent / "pythonw.exe"
                 target   = str(pythonw if pythonw.exists() else python)
-                lnk      = str(desktop / "J.A.R.V.I.S.lnk")
+                lnk      = str(desktop / "MINDBOXX.lnk")
                 icon_loc = str(ico_path) if ico_path.exists() else f"{target},0"
                 self._create_lnk_windows(lnk, target, str(script),
                                          str(script.parent), icon_loc)
 
             # ── macOS — proper .app bundle (no Terminal window) ───────────────
             elif _os == "Darwin":
-                app     = desktop / "J.A.R.V.I.S.app"
+                app     = desktop / "MINDBOXX.app"
                 mac_dir = app / "Contents" / "MacOS"
                 res_dir = app / "Contents" / "Resources"
                 mac_dir.mkdir(parents=True, exist_ok=True)
@@ -3579,7 +3763,7 @@ class MainWindow(QMainWindow):
 
                 # Launcher executable (bash — runs as background process,
                 # macOS does NOT open Terminal for executables inside .app bundles)
-                launcher = mac_dir / "AUREX"
+                launcher = mac_dir / "MINDBOXX"
                 launcher.write_text(
                     "#!/usr/bin/env bash\n"
                     f'cd "{script.parent}"\n'
@@ -3594,10 +3778,10 @@ class MainWindow(QMainWindow):
                     '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
                     '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
                     '<plist version="1.0"><dict>\n'
-                    '  <key>CFBundleExecutable</key><string>AUREX</string>\n'
+                    '  <key>CFBundleExecutable</key><string>MINDBOXX</string>\n'
                     '  <key>CFBundleIdentifier</key>'
-                    '<string>com.AUREX.assistant</string>\n'
-                    '  <key>CFBundleName</key><string>J.A.R.V.I.S</string>\n'
+                    '<string>com.mindboxx.assistant</string>\n'
+                    '  <key>CFBundleName</key><string>MINDBOXX</string>\n'
                     '  <key>CFBundlePackageType</key><string>APPL</string>\n'
                     '  <key>CFBundleVersion</key><string>1.0</string>\n'
                     '</dict></plist>\n'
@@ -3635,10 +3819,10 @@ class MainWindow(QMainWindow):
                         png_path = ico_path  # fallback to .ico
 
                 icon_line = f"Icon={png_path}\n" if png_path.exists() else ""
-                desk = desktop / "J.A.R.V.I.S.desktop"
+                desk = desktop / "MINDBOXX.desktop"
                 desk.write_text(
                     "[Desktop Entry]\n"
-                    "Name=J.A.R.V.I.S\n"
+                    "Name=MINDBOXX\n"
                     f"Exec={python} {script}\n"
                     f"Path={script.parent}\n"
                     "Type=Application\n"
@@ -3661,6 +3845,13 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         cw = self.centralWidget()
+        # Keep the side panels proportional to the reference while giving the
+        # hero the majority of the window at both compact and wide sizes.
+        if hasattr(self, "_left_panel") and hasattr(self, "_right_panel"):
+            left_w = max(138, min(250, round(cw.width() * 0.115)))
+            right_w = max(198, min(390, round(cw.width() * 0.205)))
+            self._left_panel.setFixedWidth(left_w)
+            self._right_panel.setFixedWidth(right_w)
         if self._overlay and self._overlay.isVisible():
             ow, oh = 460, 390
             self._overlay.setGeometry(
@@ -3686,7 +3877,7 @@ class MainWindow(QMainWindow):
         pw = _CameraPreview._W
         ph = self._cam_preview.height() or _CameraPreview._H
         self._cam_preview.setGeometry(
-            cw.width() - _RIGHT_W - pw - 12,
+            cw.width() - self._right_panel.width() - pw - 12,
             cw.height() - ph - 28,
             pw, ph,
         )
@@ -3794,13 +3985,13 @@ class MainWindow(QMainWindow):
         mid.setSpacing(2)
         mid.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         _disp = self._assistant_name.upper()
-        _spaced = "  ".join(list(_disp))
+        _spaced = " ".join(list(_disp))
         self._title_lbl = QLabel(_spaced)
         self._title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._title_lbl.setFont(mono_font(18, QFont.Weight.Bold))
         self._title_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
         mid.addWidget(self._title_lbl)
-        self._sub_lbl = QLabel("Adaptive Intelligence Interface")
+        self._sub_lbl = QLabel("AI FOR A BRIGHTER TOMORROW")
         self._sub_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._sub_lbl.setFont(mono_font(7))
         self._sub_lbl.setStyleSheet(f"color: {C.PRI_DIM}; background: transparent; letter-spacing: 1px;")
@@ -3809,33 +4000,34 @@ class MainWindow(QMainWindow):
         lay.addStretch(1)
 
         # ── right: date/time + tagline + avatar ─────────────────────────────
-        right_row = QHBoxLayout(); right_row.setSpacing(14)
+        right_row = QHBoxLayout(); right_row.setSpacing(18)
 
         right_col = QVBoxLayout(); right_col.setSpacing(2)
         self._date_lbl = QLabel("")
         self._date_lbl.setFont(mono_font(7, QFont.Weight.Bold))
-        self._date_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+        self._date_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent; letter-spacing: 1px;")
         self._date_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
         right_col.addWidget(self._date_lbl)
+
+        clock_row = QHBoxLayout(); clock_row.setSpacing(6)
+        clock_row.addStretch()
         self._clock_lbl = QLabel("00:00")
-        self._clock_lbl.setFont(mono_font(13, QFont.Weight.Bold))
+        self._clock_lbl.setFont(mono_font(15, QFont.Weight.Bold))
         self._clock_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
-        self._clock_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-        right_col.addWidget(self._clock_lbl)
+        self._clock_ampm_lbl = QLabel("AM")
+        self._clock_ampm_lbl.setFont(mono_font(11, QFont.Weight.Bold))
+        self._clock_ampm_lbl.setStyleSheet(f"color: {C.ACC}; background: transparent;")
+        clock_row.addWidget(self._clock_lbl)
+        clock_row.addWidget(self._clock_ampm_lbl)
+        right_col.addLayout(clock_row)
         right_row.addLayout(right_col)
 
-        tag_col = QVBoxLayout(); tag_col.setSpacing(1)
+        tag_col = QVBoxLayout(); tag_col.setSpacing(6)
         t1 = QLabel("STAY CURIOUS")
         t1.setFont(mono_font(6, QFont.Weight.Bold))
         t1.setAlignment(Qt.AlignmentFlag.AlignRight)
         t1.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; letter-spacing: 1px;")
-        t2 = QLabel("STAY AHEAD")
-        t2.setFont(mono_font(6, QFont.Weight.Bold))
-        t2.setAlignment(Qt.AlignmentFlag.AlignRight)
-        t2.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; letter-spacing: 1px;")
         tag_col.addWidget(t1)
-        tag_col.addWidget(t2)
-        right_row.addLayout(tag_col)
 
         avatar = QLabel("i")
         avatar.setFixedSize(28, 28)
@@ -3845,7 +4037,9 @@ class MainWindow(QMainWindow):
             f"color: {C.PRI}; background: {C.PANEL2}; "
             f"border: 1px solid {C.BORDER_B}; border-radius: 14px;"
         )
-        right_row.addWidget(avatar)
+        av_row = QHBoxLayout(); av_row.addStretch(); av_row.addWidget(avatar)
+        tag_col.addLayout(av_row)
+        right_row.addLayout(tag_col)
 
         lay.addLayout(right_row)
         return w
@@ -3854,13 +4048,20 @@ class MainWindow(QMainWindow):
         t = time.strftime("%I:%M %p")
         if t.startswith("0"):
             t = t[1:]
-        self._clock_lbl.setText(t)
+        time_part, _, ampm_part = t.rpartition(" ")
+        self._clock_lbl.setText(time_part or t)
+        self._clock_ampm_lbl.setText(ampm_part)
         self._date_lbl.setText(time.strftime("%a, %d %b %Y").upper())
 
     def _build_left_panel(self) -> QWidget:
         w = QWidget()
         w.setFixedWidth(_LEFT_W)
-        w.setStyleSheet(f"background: {C.DARK}; border-right: 1px solid {C.BORDER};")
+        # Floating glass panel — translucent black, not an opaque sidebar, so
+        # the central Mindboxx art stays faintly visible through it.
+        w.setStyleSheet(
+            "background: rgba(0,0,0,0.30); "
+            "border-right: 1px solid rgba(255,255,255,0.10);"
+        )
         lay = QVBoxLayout(w)
         lay.setContentsMargins(10, 18, 10, 14)
         lay.setSpacing(10)
@@ -3870,9 +4071,9 @@ class MainWindow(QMainWindow):
         # below still targets these same attributes) — only the on-screen
         # label/icon/status word changed to match CORE / SIGNAL / LINK / STATE.
         self._bar_cpu = MetricBar("CORE",   C.PRI,     "◎", "Online")
-        self._bar_net = MetricBar("SIGNAL", C.GREEN,   "◈", "Stable")
+        self._bar_net = MetricBar("SIGNAL", C.PRI_DIM, "◈", "Stable")
         self._bar_gpu = MetricBar("LINK",   C.PRI_DIM, "◇", "Connected")
-        self._bar_mem = MetricBar("STATE",  C.ACC2,    "◆", "Optimal")
+        self._bar_mem = MetricBar("STATE",  C.ACC,     "◆", "Optimal")
         self._bar_tmp = MetricBar("TMP", "#ff6688", "◐", "—")   # kept for API
                                                                   # compatibility with
                                                                   # _update_metrics; not shown
@@ -3882,7 +4083,8 @@ class MainWindow(QMainWindow):
 
         info_panel = QWidget()
         info_panel.setStyleSheet(
-            f"background: {C.PANEL2}; border: 1px solid {C.BORDER}; border-radius: 8px;"
+            "background: rgba(15,15,15,0.55); "
+            "border: 1px solid rgba(255,255,255,0.10); border-radius: 8px;"
         )
         ip_lay = QVBoxLayout(info_panel)
         ip_lay.setContentsMargins(8, 6, 8, 6)
@@ -3890,7 +4092,7 @@ class MainWindow(QMainWindow):
 
         self._uptime_lbl = QLabel("UP  --:--")
         self._uptime_lbl.setFont(mono_font(8, QFont.Weight.Bold))
-        self._uptime_lbl.setStyleSheet(f"color: {C.GREEN}; background: transparent; border: none;")
+        self._uptime_lbl.setStyleSheet(f"color: {C.PRI_DIM}; background: transparent; border: none;")
         ip_lay.addWidget(self._uptime_lbl)
 
         self._proc_lbl = QLabel("PROC  --")
@@ -3901,7 +4103,7 @@ class MainWindow(QMainWindow):
         os_name = {"Windows": "WIN", "Darwin": "macOS", "Linux": "LINUX"}.get(_OS, _OS.upper())
         os_lbl = QLabel(f"OS  {os_name}")
         os_lbl.setFont(mono_font(8))
-        os_lbl.setStyleSheet(f"color: {C.ACC2}; background: transparent; border: none;")
+        os_lbl.setStyleSheet(f"color: {C.PRI_DIM}; background: transparent; border: none;")
         ip_lay.addWidget(os_lbl)
 
         lay.addWidget(info_panel)
@@ -3920,7 +4122,10 @@ class MainWindow(QMainWindow):
     def _build_right_panel(self) -> QWidget:
         w = QWidget()
         w.setFixedWidth(_RIGHT_W)
-        w.setStyleSheet(f"background: {C.DARK}; border-left: 1px solid {C.BORDER};")
+        w.setStyleSheet(
+            "background: rgba(0,0,0,0.30); "
+            "border-left: 1px solid rgba(255,255,255,0.10);"
+        )
         lay = QVBoxLayout(w)
         lay.setContentsMargins(8, 8, 8, 8)
         lay.setSpacing(6)
@@ -3939,10 +4144,10 @@ class MainWindow(QMainWindow):
         stream_hdr.addStretch()
         live_dot = QLabel("●")
         live_dot.setFont(mono_font(7))
-        live_dot.setStyleSheet(f"color: {C.GREEN}; background: transparent;")
+        live_dot.setStyleSheet(f"color: {C.ACC}; background: transparent;")
         live_txt = QLabel("LIVE")
         live_txt.setFont(mono_font(7, QFont.Weight.Bold))
-        live_txt.setStyleSheet(f"color: {C.GREEN}; background: transparent; letter-spacing: 1px;")
+        live_txt.setStyleSheet(f"color: {C.ACC}; background: transparent; letter-spacing: 1px;")
         stream_hdr.addWidget(live_dot)
         stream_hdr.addWidget(live_txt)
         lay.addLayout(stream_hdr)
@@ -3979,18 +4184,18 @@ class MainWindow(QMainWindow):
         self._interrupt_btn.setStyleSheet(f"""
             QPushButton {{
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #26030c, stop:1 #170007);
-                color: {C.MUTED_C};
-                border: 1px solid {C.MUTED_C}; border-radius: 8px;
+                    stop:0 #2a1608, stop:1 #180d04);
+                color: {C.ACC};
+                border: 1px solid {C.ACC}; border-radius: 8px;
                 letter-spacing: 1px;
             }}
             QPushButton:hover {{
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #340412, stop:1 #22000c);
-                border: 1px solid #ff6688;
+                    stop:0 #3a1e0a, stop:1 #201004);
+                border: 1px solid {C.ACC2};
             }}
             QPushButton:pressed {{
-                background: #3a0016;
+                background: #4a2610;
             }}
         """)
         self._interrupt_btn.clicked.connect(self._do_interrupt)
@@ -4328,11 +4533,7 @@ class MainWindow(QMainWindow):
         mic_row.setContentsMargins(40, 0, 40, 0)
         mic_row.setSpacing(14)
 
-        _WAVE = "╻╹╻╹╻╻╹╻╹╻╹╻╻╹╻╹╻"
-        wave_l = QLabel(_WAVE)
-        wave_l.setFont(mono_font(12))
-        wave_l.setStyleSheet(f"color: {C.PRI_DIM}; background: transparent;")
-        wave_l.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        wave_l = AudioWaveform()
         mic_row.addWidget(wave_l, stretch=1)
 
         self._mic_big_btn = QPushButton("🎙")
@@ -4343,11 +4544,13 @@ class MainWindow(QMainWindow):
         self._mic_big_btn.clicked.connect(self._toggle_mute)
         mic_row.addWidget(self._mic_big_btn)
 
-        wave_r = QLabel(_WAVE)
-        wave_r.setFont(mono_font(12))
-        wave_r.setStyleSheet(f"color: {C.PRI_DIM}; background: transparent;")
-        wave_r.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        wave_r = AudioWaveform(mirrored=True)
         mic_row.addWidget(wave_r, stretch=1)
+        self._waveforms = (wave_l, wave_r)
+
+        self._wave_tmr = QTimer(self)
+        self._wave_tmr.timeout.connect(self._sync_waveforms)
+        self._wave_tmr.start(40)
 
         v.addLayout(mic_row)
 
@@ -4400,12 +4603,21 @@ class MainWindow(QMainWindow):
             l.setStyleSheet(f"color: {color}; background: transparent;")
             return l
 
-        s_lay.addWidget(_fl("[F4] Mute  ·  [F11] Fullscreen"))
+        s_lay.addWidget(_fl("[F1] Help  |  [F11] Fullscreen"))
         s_lay.addStretch()
-        s_lay.addWidget(_fl(f"{self._assistant_name.upper()}  {APP_VERSION}  ·  By FatihMakes", C.PRI_DIM))
+        s_lay.addWidget(_fl(f"{self._assistant_name.upper()} v1.0   |   Build a brighter tomorrow", C.PRI_DIM))
         v.addWidget(strip)
 
         return outer
+
+    def _sync_waveforms(self):
+        if not hasattr(self, "_waveforms") or not hasattr(self, "hud"):
+            return
+        level = self.hud._amp_disp if not self._muted else 0.0
+        active = (not self._muted and
+                  self.hud.state in ("LISTENING", "SPEAKING"))
+        for waveform in self._waveforms:
+            waveform.set_level(level, active)
 
     def _on_file_selected(self, path: str):
         self._current_file = path
@@ -4467,7 +4679,7 @@ class MainWindow(QMainWindow):
                 key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                     r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
                 try:
-                    winreg.QueryValueEx(key, "AUREX_AI")
+                    winreg.QueryValueEx(key, "MINDBOXX_AI")
                     return True
                 except FileNotFoundError:
                     return False
@@ -4475,9 +4687,9 @@ class MainWindow(QMainWindow):
                     winreg.CloseKey(key)
             elif _OS == "Darwin":
                 return (Path.home() / "Library" / "LaunchAgents"
-                        / "com.AUREX.assistant.plist").exists()
+                        / "com.mindboxx.assistant.plist").exists()
             else:
-                return (Path.home() / ".config" / "autostart" / "AUREX.desktop").exists()
+                return (Path.home() / ".config" / "autostart" / "MINDBOXX.desktop").exists()
         except Exception:
             return False
 
@@ -4490,17 +4702,17 @@ class MainWindow(QMainWindow):
                 reg = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                     r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_ALL_ACCESS)
                 if currently_on:
-                    winreg.DeleteValue(reg, "AUREX_AI")
+                    winreg.DeleteValue(reg, "MINDBOXX_AI")
                 else:
                     pythonw = Path(sys.executable).parent / "pythonw.exe"
                     exe = str(pythonw if pythonw.exists() else sys.executable)
-                    winreg.SetValueEx(reg, "AUREX_AI", 0, winreg.REG_SZ,
+                    winreg.SetValueEx(reg, "MINDBOXX_AI", 0, winreg.REG_SZ,
                                       f'"{exe}" "{script}"')
                 winreg.CloseKey(reg)
             elif _OS == "Darwin":
                 plist_dir = Path.home() / "Library" / "LaunchAgents"
                 plist_dir.mkdir(parents=True, exist_ok=True)
-                plist = plist_dir / "com.AUREX.assistant.plist"
+                plist = plist_dir / "com.mindboxx.assistant.plist"
                 if currently_on:
                     plist.unlink(missing_ok=True)
                 else:
@@ -4509,7 +4721,7 @@ class MainWindow(QMainWindow):
                         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
                         '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
                         '<plist version="1.0"><dict>\n'
-                        '  <key>Label</key><string>com.AUREX.assistant</string>\n'
+                        '  <key>Label</key><string>com.mindboxx.assistant</string>\n'
                         '  <key>ProgramArguments</key><array>\n'
                         f'    <string>{sys.executable}</string>\n'
                         f'    <string>{script}</string>\n'
@@ -4520,7 +4732,7 @@ class MainWindow(QMainWindow):
             else:
                 desk_dir = Path.home() / ".config" / "autostart"
                 desk_dir.mkdir(parents=True, exist_ok=True)
-                desk = desk_dir / "AUREX.desktop"
+                desk = desk_dir / "MINDBOXX.desktop"
                 if currently_on:
                     desk.unlink(missing_ok=True)
                 else:
@@ -4545,10 +4757,10 @@ class MainWindow(QMainWindow):
             self._autostart_btn.setText("◉  AUTO-START: ON")
             self._autostart_btn.setStyleSheet(f"""
                 QPushButton {{
-                    background: #001a08; color: {C.GREEN};
+                    background: #141414; color: {C.GREEN};
                     border: 1px solid {C.GREEN_D}; border-radius: 3px;
                 }}
-                QPushButton:hover {{ background: #002010; }}
+                QPushButton:hover {{ background: #1c1c1c; }}
             """)
         else:
             self._autostart_btn.setText("◉  AUTO-START: OFF")
@@ -4595,10 +4807,10 @@ class MainWindow(QMainWindow):
             return
         st = self._wake_state()
         _on = f"""
-            QPushButton {{ background: #001a08; color: {C.GREEN};
+            QPushButton {{ background: #141414; color: {C.GREEN};
                 border: 1px solid {C.GREEN_D}; border-radius: 3px;
                 text-align: left; padding: 0 8px; }}
-            QPushButton:hover {{ background: #002010; }}"""
+            QPushButton:hover {{ background: #1c1c1c; }}"""
         _off = f"""
             QPushButton {{ background: transparent; color: {C.TEXT_DIM};
                 border: 1px solid {C.BORDER}; border-radius: 3px;
@@ -4668,11 +4880,11 @@ class MainWindow(QMainWindow):
             self._brief_btn.setText("☀  MORNING BRIEF: ON")
             self._brief_btn.setStyleSheet(f"""
                 QPushButton {{
-                    background: #001a08; color: {C.GREEN};
+                    background: #141414; color: {C.GREEN};
                     border: 1px solid {C.GREEN_D}; border-radius: 3px;
                     text-align: left; padding: 0 8px;
                 }}
-                QPushButton:hover {{ background: #002010; }}
+                QPushButton:hover {{ background: #1c1c1c; }}
             """)
         else:
             self._brief_btn.setText("☀  MORNING BRIEF: OFF")
@@ -4693,7 +4905,7 @@ class MainWindow(QMainWindow):
             self._customize_overlay.hide()
         cw = self.centralWidget()
         ov = CustomizeOverlay(
-            cfg.get("assistant_name", "AUREX") or "AUREX",
+            cfg.get("assistant_name", "MINDBOXX") or "MINDBOXX",
             cfg.get("user_name", ""),
             cfg.get("ui_color", "") or DEFAULT_UI_COLOR,
             cfg.get("voice_name", ""),
@@ -4720,14 +4932,14 @@ class MainWindow(QMainWindow):
     def _apply_name_update(self, name: str, user_name: str, ui_color: str = "",
                            voice: str = ""):
         """Update all name/theme-dependent UI elements and persist to config."""
-        self._assistant_name = name.strip() or "AUREX"
+        requested_name = name.strip()
+        if requested_name.upper() in {"AUREX", "J.A.R.V.I.S", "JARVIS"}:
+            requested_name = "MINDBOXX"
+        self._assistant_name = requested_name or "MINDBOXX"
         display = self._assistant_name.upper()
         self.setWindowTitle(f"{display} — {APP_VERSION}")
         self._title_lbl.setText(display)
-        if display in ("AUREX", "J.A.R.V.I.S"):
-            self._sub_lbl.setText("Just A Rather Very Intelligent System")
-        else:
-            self._sub_lbl.setText("Personal AI Assistant")
+        self._sub_lbl.setText("AI FOR A BRIGHTER TOMORROW")
         self._log._ai_name_lc = self._assistant_name.lower()
         self.hud._assistant_name = display
 
@@ -4953,12 +5165,12 @@ class MainWindow(QMainWindow):
             self._mute_btn.setStyleSheet(f"""
                 QPushButton {{
                     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                        stop:0 #012a17, stop:1 #001a0d);
-                    color: {C.GREEN};
-                    border: 1px solid {C.GREEN}; border-radius: 8px;
+                        stop:0 #141414, stop:1 #0a0a0a);
+                    color: {C.PRI};
+                    border: 1px solid {C.BORDER_B}; border-radius: 8px;
                     letter-spacing: 1px;
                 }}
-                QPushButton:hover {{ background: #013a1f; }}
+                QPushButton:hover {{ background: #1c1c1c; border: 1px solid {C.ACC}; }}
             """)
 
         # keep the big AUREX-style mic button (bottom bar) in sync
@@ -5039,7 +5251,7 @@ class MainWindow(QMainWindow):
             self._overlay.hide()
             self._overlay = None
         self._apply_state("LISTENING")
-        self._assistant_name = _read_full_config().get("assistant_name", "AUREX") or "AUREX"
+        self._assistant_name = _read_full_config().get("assistant_name", "MINDBOXX") or "MINDBOXX"
         self._log.append_log(f"SYS: Initialised. OS={os_name.upper()}. {self._assistant_name} online.")
         self._seed_intelligence_stream()
 
