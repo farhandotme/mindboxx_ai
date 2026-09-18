@@ -1,5 +1,6 @@
 import os
 import shutil
+import subprocess
 import platform
 from pathlib import Path
 from datetime import datetime
@@ -632,6 +633,60 @@ def get_file_info(path: str, name: str = "") -> str:
     except Exception as e:
         return f"Could not get file info: {e}"
 
+def open_file(path: str, name: str = "") -> str:
+    """Open a file or folder with whatever the OS considers its default
+    handler — a text file opens in the default editor, a folder opens in
+    File Explorer/Finder/the file manager, an image in the default viewer,
+    etc. This is what 'open it' / 'show me' should resolve to once a file
+    has been created or located — not a vision-based screen click."""
+    try:
+        base   = _resolve_path(path)
+        target = (base / name) if name else base
+        if not _is_safe_path(target):
+            return f"Access denied: {target}"
+        if not target.exists():
+            return f"Not found: {target.name or target}"
+
+        if _OS == "Windows":
+            os.startfile(str(target))  # type: ignore[attr-defined]
+        elif _OS == "Darwin":
+            subprocess.run(["open", str(target)], check=False)
+        else:
+            subprocess.run(["xdg-open", str(target)], check=False)
+
+        kind = "folder" if target.is_dir() else "file"
+        return f"Opened {kind}: {target.name}"
+    except Exception as e:
+        return f"Could not open '{name or path}': {e}"
+
+
+def reveal_file(path: str, name: str = "") -> str:
+    """Open the file's PARENT folder in File Explorer/Finder with the file
+    itself pre-selected/highlighted. Use this for 'show me where that is' /
+    'show me that file' when the user wants to see it sitting on disk rather
+    than have it opened in an editor."""
+    try:
+        base   = _resolve_path(path)
+        target = (base / name) if name else base
+        if not _is_safe_path(target):
+            return f"Access denied: {target}"
+        if not target.exists():
+            return f"Not found: {target.name or target}"
+
+        if _OS == "Windows":
+            subprocess.run(["explorer", "/select,", str(target)], check=False)
+        elif _OS == "Darwin":
+            subprocess.run(["open", "-R", str(target)], check=False)
+        else:
+            # Most Linux file managers don't support "select this item"
+            # from the CLI reliably, so fall back to opening the folder.
+            subprocess.run(["xdg-open", str(target.parent)], check=False)
+
+        return f"Revealed in file manager: {target.name}"
+    except Exception as e:
+        return f"Could not reveal '{name or path}': {e}"
+
+
 def file_controller(
     parameters: dict = None,
     response=None,
@@ -701,6 +756,12 @@ def file_controller(
         elif action == "info":
             return get_file_info(path, name=name)
 
+        elif action == "open":
+            return open_file(path, name=name)
+
+        elif action == "reveal":
+            return reveal_file(path, name=name)
+
         else:
             return f"Unknown action: '{action}'"
 
@@ -711,13 +772,13 @@ def file_controller(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "file_controller",
-    "description": "Manages files and folders: list, create, delete, move, copy, rename, read, write, find, disk usage.",
+    "description": "Manages files and folders: list, create, delete, move, copy, rename, read, write, find, disk usage, open, reveal. Use action='create_file' (with content) whenever the user wants text written to a new file and saved somewhere — e.g. 'write hi and save it as hi.txt on the desktop' — this writes straight to disk instead of typing into an app and clicking Save As. Use action='open' for 'open/show me that file or folder' (launches it in its default app / file manager) and action='reveal' to open its containing folder with it highlighted — prefer these over guessing at screen coordinates.",
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "list | create_file | create_folder | delete | move | copy | rename | read | write | find | largest | disk_usage | organize_desktop | info"
+                "description": "list | create_file | create_folder | delete | move | copy | rename | read | write | find | largest | disk_usage | organize_desktop | info | open | reveal"
             },
             "path": {
                 "type": "STRING",
