@@ -187,9 +187,28 @@ def _click(x=None, y=None, button: str = "left", clicks: int = 1) -> str:
     return f"Clicked at current position [{button}]"
 
 
+_DIALOG_OPENING_KEYS = {
+    frozenset(k.lower() for k in combo) for combo in (
+        ("ctrl", "s"), ("command", "s"),
+        ("ctrl", "shift", "s"), ("command", "shift", "s"),
+        ("ctrl", "o"), ("command", "o"),
+        ("ctrl", "p"), ("command", "p"),
+        ("ctrl", "n"), ("command", "n"),
+        ("alt", "f4"),
+    )
+}
+
+
 def _hotkey(*keys) -> str:
     _require_pyautogui()
     pyautogui.hotkey(*keys)
+    # Save/Open/Print/New-style shortcuts spawn a new OS dialog or window,
+    # which needs a beat to render and grab keyboard focus. Without this,
+    # a "type"/"click" issued right after the hotkey races the dialog and
+    # the keystrokes land nowhere (e.g. a Save As filename never gets typed).
+    if frozenset(k.lower() for k in keys) in _DIALOG_OPENING_KEYS:
+        time.sleep(0.8)
+        return f"Hotkey: {'+'.join(keys)} (waited for dialog to open)"
     return f"Hotkey: {'+'.join(keys)}"
 
 
@@ -403,6 +422,13 @@ def computer_control(
       screen_click  — AI element finder + click
       random_data   — generate fake form data
       user_data     — pull real data from memory
+
+    NOTE — creating/saving a text file: don't drive this with type + Ctrl+S +
+    type-filename. Use file_controller(action='create_file', ...) to write the
+    file directly instead; it's instant and never races a Save-As dialog. The
+    'hotkey' action above already waits after dialog-opening combos (ctrl+s,
+    ctrl+o, ctrl+p, ctrl+n, ...) for exactly this reason, but writing the file
+    directly is still the more reliable path whenever it's available.
     """
     params = parameters or {}
     action = params.get("action", "").lower().strip()
@@ -517,7 +543,7 @@ def computer_control(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "computer_control",
-    "description": "Direct computer control: type, click, hotkeys, scroll, move mouse, screenshots, find elements on screen.",
+    "description": "Direct computer control: type, click, hotkeys, scroll, move mouse, screenshots, find elements on screen. To create/save a text file, prefer file_controller(action='create_file') instead of typing + Ctrl+S — it writes the file directly and never races a Save-As dialog.",
     "parameters": {
         "type": "OBJECT",
         "properties": {

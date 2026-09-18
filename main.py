@@ -105,6 +105,16 @@ CHUNK_SIZE          = 1024
 _LEVEL_FLOOR = 60.0
 _LEVEL_FULL  = 2600.0
 
+# Voice barge-in: while AUREX is talking, the mic is otherwise muted (see
+# _listen_audio) so its own voice can't be picked up and echoed back to it.
+# To still let the user cut in by just talking, we watch the mic level even
+# during that window and require it to read as genuine speech (not a click,
+# a cough, or speaker bleed) for several consecutive frames in a row before
+# we treat it as an interruption. _BARGE_IN_FRAMES × CHUNK_SIZE/SEND_SAMPLE_RATE
+# is roughly the reaction time — tuned to feel instant without being twitchy.
+_BARGE_IN_LEVEL  = 0.5
+_BARGE_IN_FRAMES = 3
+
 
 def _pcm_level(samples) -> float:
     """Map a block of int16 PCM samples to a 0.0–1.0 loudness level for the HUD
@@ -381,6 +391,7 @@ class AUREXLive:
         self._vision_last_time     = 0.0     # monotonic time of last screen_process call (cooldown guard)
         self._vision_busy          = False   # True while a vision capture/inject cycle is in flight
         self._interrupted          = False   # True while draining audio after user interrupt
+        self._barge_in_streak      = 0       # consecutive loud mic frames while AUREX is speaking
         self.ui.on_text_command   = self._on_text_command
         self.ui.on_remote_clicked = self._make_remote_key
         self.ui.on_interrupt      = self.interrupt
@@ -644,6 +655,7 @@ class AUREXLive:
         with self._speaking_lock:
             self._is_speaking = value
         if value:
+            self._barge_in_streak = 0   # fresh window each time a new reply starts
             self.ui.set_state("SPEAKING")
         elif not self.ui.muted:
             self.ui.set_state("LISTENING")
@@ -965,7 +977,32 @@ class AUREXLive:
                 return
             with self._speaking_lock:
                 AUREX_speaking = self._is_speaking
-            if not AUREX_speaking and not self.ui.muted and not self._phone_active:
+
+            if AUREX_speaking:
+                # Mic is otherwise held back while AUREX talks (see module
+                # note above _BARGE_IN_LEVEL) — but we still watch its level
+                # so the user can interrupt just by speaking over it, not
+                # only via the ESC key / Interrupt button.
+                if self.ui.muted or self._phone_active:
+                    return
+                level = _pcm_level(indata)
+                if level >= _BARGE_IN_LEVEL:
+                    self._barge_in_streak += 1
+                else:
+                    self._barge_in_streak = 0
+                if self._barge_in_streak >= _BARGE_IN_FRAMES:
+                    self._barge_in_streak = 0
+                    self.interrupt()   # stops playback + flips _is_speaking off
+                    # Forward the chunk that triggered the barge-in too, so
+                    # the first word the user said isn't lost.
+                    data = indata.tobytes()
+                    loop.call_soon_threadsafe(
+                        self.out_queue.put_nowait,
+                        {"data": data, "mime_type": "audio/pcm"}
+                    )
+                return
+
+            if not self.ui.muted and not self._phone_active:
                 data = indata.tobytes()
                 loop.call_soon_threadsafe(
                     self.out_queue.put_nowait,
