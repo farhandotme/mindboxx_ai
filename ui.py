@@ -4440,6 +4440,14 @@ class MainWindow(QMainWindow):
         cust_btn.clicked.connect(self._open_customize)
         lay.addWidget(cust_btn)
 
+        key_btn = QPushButton("🔑  CHANGE API KEY")
+        key_btn.setFixedHeight(26)
+        key_btn.setFont(mono_font(7))
+        key_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        key_btn.setStyleSheet(_BTN_STYLE_DIM)
+        key_btn.clicked.connect(self._show_setup)
+        lay.addWidget(key_btn)
+
         self._brief_btn = QPushButton()
         self._brief_btn.setFixedHeight(26)
         self._brief_btn.setFont(mono_font(7))
@@ -5393,10 +5401,20 @@ class MainWindow(QMainWindow):
 
     def _on_setup_done(self, key: str, os_name: str):
         os.makedirs(CONFIG_DIR, exist_ok=True)
-        API_FILE.write_text(
-            json.dumps({"gemini_api_key": key, "os_system": os_name}, indent=4),
-            encoding="utf-8",
-        )
+        # Merge into whatever is already in api_keys.json (tts/stt settings,
+        # llm_provider, assistant_name, ...) instead of overwriting the file —
+        # this fires again any time the key is changed later, not just on the
+        # very first run, so a blind overwrite would silently wipe everything
+        # else the user had configured.
+        existing: dict = {}
+        if API_FILE.exists():
+            try:
+                existing = json.loads(API_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                existing = {}
+        existing["gemini_api_key"] = key.strip()
+        existing["os_system"]      = os_name
+        API_FILE.write_text(json.dumps(existing, indent=4), encoding="utf-8")
         self._ready = True
         if self._overlay:
             self._overlay.hide()
