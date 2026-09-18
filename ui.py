@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import psutil
@@ -24,8 +25,8 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QBrush, QColor, QConicalGradient, QDragEnterEvent, QDropEvent, QFont,
-    QFontDatabase, QKeySequence, QLinearGradient, QPainter, QPainterPath,
-    QPen, QPixmap, QRadialGradient, QShortcut,
+    QFontDatabase, QFontMetricsF, QKeySequence, QLinearGradient, QPainter,
+    QPainterPath, QPen, QPixmap, QRadialGradient, QShortcut,
 )
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
@@ -65,8 +66,8 @@ def _read_full_config() -> dict:
         return {}
 
 
-_DEFAULT_W, _DEFAULT_H = 980, 700
-_MIN_W,     _MIN_H     = 820, 580
+_DEFAULT_W, _DEFAULT_H = 1024, 552
+_MIN_W,     _MIN_H     = 820, 520
 _LEFT_W  = 154
 _RIGHT_W = 224
 
@@ -111,6 +112,19 @@ _HUE_LINKED = (
 _PALETTE_DEFAULTS: dict[str, str] = {k: getattr(C, k) for k in _HUE_LINKED}
 
 DEFAULT_UI_COLOR = _PALETTE_DEFAULTS["PRI"]
+
+
+@dataclass
+class MindboxxLogoComposition:
+    """Cached geometry for the immutable M plus its two overlay elements."""
+
+    m_bounds: QRectF | None = None
+    word_font: QFont | None = None
+    word_rect: QRectF | None = None
+    word_metrics: QFontMetricsF | None = None
+    orb_center: QPointF | None = None
+    orb_radius: float = 0.0
+    key: tuple | None = None
 
 
 def apply_ui_accent(accent_hex: str) -> bool:
@@ -458,6 +472,8 @@ class HudCanvas(QWidget):
         # artwork bounds so it stays beside the wordmark.
         self._orb_anchor: tuple[float, float] | None = None
         self._orb_base_r: float = 40.0
+        self._logo_composition = MindboxxLogoComposition()
+        self._draw_mindboxx_art = self._draw_mindboxx_art_composed
         # Repaint throttle counter (idle frames drop to ~20 Hz — see _step()).
         self._paint_tick = 0
         self._load_mindboxx_asset()
@@ -469,6 +485,132 @@ class HudCanvas(QWidget):
         self._amp_disp  = 0.0
         self._base_scale = 1.0    # slow "breathing" target; amp is added per-frame
         self._base_halo  = 55.0
+
+        self._ring_badges: list[dict] = []
+        self._ring_angle  = 0.0
+        self._tmr = QTimer(self)
+        self._tmr.timeout.connect(self._step)
+        self._tmr.start(16)
+
+    def _update_logo_composition(
+        self, m_bounds: QRectF, key: tuple
+    ) -> None:
+        """Position the wordmark and orb from the rendered M bounds.
+
+        The M remains a cached, immutable image. This function only derives
+        the geometry of the two elements that sit on top of it, and is called
+        when the rendered M size changes rather than on every animation frame.
+        """
+        if self._logo_composition.key == key:
+            return
+
+        m_width = m_bounds.width()
+        m_height = m_bounds.height()
+
+        # Choose a light sans-serif size from measured text width, targeting
+        # approximately 31% of the displayed M width.
+        target_width = m_width * 0.31
+        font = QFont("Arial")
+        font.setWeight(QFont.Weight.Light)
+        font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 100)
+        chosen_metrics = QFontMetricsF(font)
+        chosen_size = max(12, int(m_height * 0.10))
+        for px in range(10, max(12, int(m_height * 0.24)) + 1):
+            font.setPixelSize(px)
+            metrics = QFontMetricsF(font)
+            if metrics.horizontalAdvance("mindboxx") >= target_width:
+                chosen_size = px
+                chosen_metrics = metrics
+                break
+            chosen_size = px
+            chosen_metrics = metrics
+        font.setPixelSize(chosen_size)
+        chosen_metrics = QFontMetricsF(font)
+        word_width = chosen_metrics.horizontalAdvance("mindboxx")
+        word_height = chosen_metrics.height()
+
+        # The visual center is tied to the M, not to the window or hero pane.
+        # The orb sits at a fixed spot inside the M artwork itself — inside
+        # the left arch, not centered as part of a orb+word group — and
+        # "mindboxx" is placed directly to the right of it, in front of the
+        # orb, rather than the two being centered together under the M.
+        word_center_y = m_bounds.top() + m_height * 0.60
+        orb_radius = m_height * 0.085
+        orb_gap = orb_radius * 0.55  # clear space between orb and the "m"
+
+        orb_center = QPointF(
+            m_bounds.left() + m_width * 0.33,
+            word_center_y,
+        )
+        word_rect = QRectF(
+            orb_center.x() + orb_radius + orb_gap,
+            word_center_y - word_height * 0.58,
+            word_width,
+            word_height * 1.16,
+        )
+
+        self._logo_composition = MindboxxLogoComposition(
+            m_bounds=m_bounds,
+            word_font=font,
+            word_rect=word_rect,
+            word_metrics=chosen_metrics,
+            orb_center=orb_center,
+            orb_radius=orb_radius,
+            key=key,
+        )
+        self._orb_anchor = (orb_center.x(), orb_center.y())
+        self._orb_base_r = orb_radius
+
+    def _draw_mindboxx_art_composed(
+        self, p: QPainter, W: int, H: int
+    ) -> None:
+        """Render the locked M and the measured logo overlays."""
+        if self._m_px is None:
+            self._orb_anchor = (W / 2, H / 2)
+            self._orb_base_r = min(W, H) * 0.05
+            return
+
+        dpr = self.devicePixelRatioF() or 1.0
+        aspect = self._m_px.width() / max(1, self._m_px.height())
+        target_w = W * 0.78
+        target_h = H * 0.74
+        draw_h = min(target_h, target_w / aspect)
+        draw_w = draw_h * aspect
+        x = (W - draw_w) / 2
+        y = (H - draw_h) / 2 - min(W, H) * 0.015
+        key = (round(draw_w), round(draw_h), round(dpr, 3))
+
+        if self._m_cache is None or self._m_cache_key != key:
+            self._m_cache = self._m_px.scaled(
+                max(1, round(draw_w * dpr)),
+                max(1, round(draw_h * dpr)),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self._m_cache.setDevicePixelRatio(dpr)
+            self._m_cache_key = key
+
+        p.drawPixmap(QPointF(x, y), self._m_cache)
+        m_bounds = QRectF(x, y, draw_w, draw_h)
+        if self._logo_composition.key != key:
+            self._update_logo_composition(m_bounds, key)
+        composition = self._logo_composition
+        word_font = composition.word_font
+        word_rect = composition.word_rect
+        orb_center = composition.orb_center
+        if word_font is None or word_rect is None or orb_center is None:
+            return
+
+        p.setFont(word_font)
+        p.setPen(QPen(qcol("#E7E7E7", 235)))
+        p.drawText(
+            word_rect,
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            "mindboxx",
+        )
+        self._orb_anchor = (orb_center.x(), orb_center.y())
+        self._orb_base_r = composition.orb_radius
+        return
 
         # Orbiting integration ring — badges for live subsystems (voice, wake
         # word, memory, camera, clipboard) plus any discovered plugins, drawn
@@ -813,7 +955,11 @@ class HudCanvas(QWidget):
         # Audio threads push peaks into _live_amp; decay it toward silence so
         # gaps between chunks fade out instead of freezing, then smooth it.
         self._live_amp *= 0.86
-        self._amp_disp += (self._live_amp - self._amp_disp) * 0.45
+        target_amp = max(0.0, min(1.0, self._live_amp))
+        if target_amp > self._amp_disp:
+            self._amp_disp += (target_amp - self._amp_disp) * 0.30
+        else:
+            self._amp_disp += (target_amp - self._amp_disp) * 0.10
         amp = self._amp_disp
 
         # Slow "breathing" base target (random shimmer), refreshed on a timer.
@@ -821,9 +967,9 @@ class HudCanvas(QWidget):
             if self.speaking:
                 self._base_scale = 1.03
                 self._base_halo  = 122.0
-            elif self.muted:
+            elif self.muted or self.state in ("THINKING", "PROCESSING"):
                 self._base_scale = random.uniform(0.998, 1.002)
-                self._base_halo  = random.uniform(15, 28)
+                self._base_halo  = random.uniform(22, 36)
             else:
                 self._base_scale = random.uniform(1.001, 1.008)
                 self._base_halo  = random.uniform(48, 68)
@@ -831,13 +977,13 @@ class HudCanvas(QWidget):
 
         # Every frame, the live audio level lifts the target on top of the base
         # — this is what makes the core visibly pulse to the actual voice.
-        if self.muted:
+        if self.muted or self.state in ("THINKING", "PROCESSING"):
             self._tgt_scale, self._tgt_halo = self._base_scale, self._base_halo
         elif self.speaking:
-            self._tgt_scale = self._base_scale + amp * 0.13
+            self._tgt_scale = min(1.15, self._base_scale + amp * 0.13)
             self._tgt_halo  = self._base_halo  + amp * 95.0
         else:
-            self._tgt_scale = self._base_scale + amp * 0.06
+            self._tgt_scale = min(1.15, self._base_scale + amp * 0.06)
             self._tgt_halo  = self._base_halo  + amp * 75.0
 
         sp = 0.38 if self.speaking else (0.30 if amp > 0.02 else 0.15)
@@ -965,54 +1111,42 @@ class HudCanvas(QWidget):
             p.drawPixmap(int(cx - scaled.width() / 2),
                          int(cy - scaled.height() / 2), scaled)
         else:
-            # Mindboxx orb: SMALL premium white→orange gradient sphere,
-            # anchored beside the wordmark rather than centered over the M.
-            # Sized as a fraction of the hero canvas (not the old fw*0.27
-            # giant sphere) so the M and wordmark stay the dominant visual.
+            # Mindboxx orb: simple flat gradient sphere, matching the
+            # brand mark exactly — pale warm cream at the top smoothly
+            # fading to vivid orange at the bottom. No glass highlights,
+            # no rim ring, no swirl/marbling: just a clean, minimal dot
+            # like the logo, plus a soft ambient glow underneath.
             ox, oy = self._orb_anchor if self._orb_anchor else (cx, cy)
-            base_r = getattr(self, "_orb_base_r", fw * 0.05)
+            base_r = getattr(self, "_orb_base_r", fw * 0.085)
             orb_r = base_r * self._scale
             muted_tint = self.muted
 
             if muted_tint:
-                bloom_col, halo_col, mid_col, inner_col = (
-                    (90, 90, 90), (70, 70, 70), (140, 140, 140), (215, 215, 215))
+                top_col, bottom_col, glow_col = (
+                    (232, 232, 232), (120, 120, 120), (150, 150, 150))
             else:
-                bloom_col, halo_col, mid_col, inner_col = (
-                    (255, 138, 61), (255, 138, 61), (255, 180, 127), (255, 245, 237))
+                top_col, bottom_col, glow_col = (
+                    (252, 236, 227), (252, 139, 77), (255, 138, 61))
 
-            # very soft external bloom — restrained, not a giant aura
-            bloom_r = orb_r * 1.7
-            bloom = QRadialGradient(QPointF(ox, oy), bloom_r)
-            bloom.setColorAt(0.0, QColor(*bloom_col, min(48, int(self._halo * 0.26))))
-            bloom.setColorAt(1.0, QColor(*bloom_col, 0))
+            # soft ambient glow beneath/around the orb — restrained, not
+            # a giant aura, just enough to lift it off the background
+            glow_c = QPointF(ox, oy + orb_r * 0.15)
+            glow_r = orb_r * 1.8
+            glow = QRadialGradient(glow_c, glow_r)
+            glow.setColorAt(0.0, QColor(*glow_col, min(70, int(self._halo * 0.4))))
+            glow.setColorAt(1.0, QColor(*glow_col, 0))
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(bloom))
-            p.drawEllipse(QPointF(ox, oy), bloom_r, bloom_r)
+            p.setBrush(QBrush(glow))
+            p.drawEllipse(glow_c, glow_r, glow_r)
 
-            # thin translucent halo
-            halo_r = orb_r * 1.4
-            halo = QRadialGradient(QPointF(ox, oy), halo_r)
-            halo.setColorAt(0.0, QColor(*halo_col, 0))
-            halo.setColorAt(0.78, QColor(*halo_col, min(120, int(self._halo * 1.1))))
-            halo.setColorAt(1.0, QColor(*halo_col, 0))
-            p.setBrush(QBrush(halo))
-            p.drawEllipse(QPointF(ox, oy), halo_r, halo_r)
-
-            # core body — white-hot center fading through peach/orange to the edge
-            body = QRadialGradient(QPointF(ox - orb_r * 0.22, oy - orb_r * 0.28), orb_r * 1.05)
-            body.setColorAt(0.0, QColor(*inner_col, 255))
-            body.setColorAt(0.35, QColor(*inner_col, 255))
-            body.setColorAt(0.65, QColor(*mid_col, 250))
-            body.setColorAt(1.0, QColor(*bloom_col, 235))
+            # flat top-to-bottom gradient body — cream to orange, exactly
+            # like the reference mark, no offset/diagonal lighting trick
+            body = QLinearGradient(QPointF(ox, oy - orb_r), QPointF(ox, oy + orb_r))
+            body.setColorAt(0.0, QColor(*top_col, 255))
+            body.setColorAt(1.0, QColor(*bottom_col, 255))
             p.setBrush(QBrush(body))
             p.drawEllipse(QPointF(ox, oy), orb_r, orb_r)
 
-            # thin bright rim
-            rim_a = max(120, min(255, int(self._halo * 1.6)))
-            p.setPen(QPen(qcol(C.WHITE, rim_a), 1.0))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(QPointF(ox, oy), orb_r, orb_r)
 
         # particles
         for pt in self._particles:
@@ -1386,7 +1520,7 @@ class FileDropZone(QWidget):
         super().__init__(parent)
         self.setAcceptDrops(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedHeight(100)
+        self.setFixedHeight(64)
         self._current_file: str | None = None
         self._hovering  = False
         self._drag_over = False
@@ -1517,11 +1651,11 @@ class _DropCanvas(QWidget):
         p.drawLine(QPointF(cx - 14, cy + 4), QPointF(cx + 14, cy + 4))
         p.setFont(mono_font(8))
         p.setPen(QPen(qcol(C.PRI_DIM if not hover else C.TEXT), 1))
-        p.drawText(QRectF(0, cy + 8, W, 16), Qt.AlignmentFlag.AlignCenter,
+        p.drawText(QRectF(0, cy + 3, W, 14), Qt.AlignmentFlag.AlignCenter,
                    "Drop file here  or  Click to Browse")
         p.setFont(mono_font(7))
-        p.setPen(QPen(qcol("#1a4a5a"), 1))
-        p.drawText(QRectF(0, cy + 24, W, 14), Qt.AlignmentFlag.AlignCenter,
+        p.setPen(QPen(qcol(C.TEXT_DIM), 1))
+        p.drawText(QRectF(0, cy + 17, W, 13), Qt.AlignmentFlag.AlignCenter,
                    "Images · Video · Audio · PDF · Docs · Code · Data")
 
     def _paint_drag_over(self, p, W, H):
@@ -1561,7 +1695,7 @@ class _DropCanvas(QWidget):
                    f"{ext_str}  ·  {size_str}")
 
         p.setFont(mono_font(6))
-        p.setPen(QPen(qcol("#1e5c6a"), 1))
+        p.setPen(QPen(qcol(C.TEXT_DIM), 1))
         par = str(path.parent)
         if len(par) > 42: par = "…" + par[-41:]
         p.drawText(QRectF(tx, H * 0.18 + 34, tw, 12),
@@ -3283,8 +3417,8 @@ class MainWindow(QMainWindow):
         root.addWidget(self._build_header())
 
         body = QHBoxLayout()
-        body.setContentsMargins(0, 0, 0, 0)
-        body.setSpacing(0)
+        body.setContentsMargins(8, 0, 8, 0)
+        body.setSpacing(8)
 
         self._left_panel = self._build_left_panel()
         body.addWidget(self._left_panel, stretch=0)
@@ -3848,7 +3982,7 @@ class MainWindow(QMainWindow):
         # Keep the side panels proportional to the reference while giving the
         # hero the majority of the window at both compact and wide sizes.
         if hasattr(self, "_left_panel") and hasattr(self, "_right_panel"):
-            left_w = max(138, min(250, round(cw.width() * 0.115)))
+            left_w = max(154, min(250, round(cw.width() * 0.15)))
             right_w = max(198, min(390, round(cw.width() * 0.205)))
             self._left_panel.setFixedWidth(left_w)
             self._right_panel.setFixedWidth(right_w)
@@ -3942,29 +4076,33 @@ class MainWindow(QMainWindow):
 
     def _build_header(self) -> QWidget:
         w = QWidget()
-        w.setFixedHeight(64)
-        w.setStyleSheet(f"background: {C.DARK}; border-bottom: 1px solid {C.BORDER_B};")
+        w.setFixedHeight(58)
+        w.setStyleSheet(
+            f"background: {C.DARK}; border-bottom: 1px solid rgba(255,255,255,0.12);"
+        )
         lay = QHBoxLayout(w)
-        lay.setContentsMargins(20, 0, 20, 0)
-        lay.setSpacing(10)
+        lay.setContentsMargins(18, 0, 16, 0)
+        lay.setSpacing(8)
 
         # ── left: breadcrumb nav + settings gear ────────────────────────────
-        left_col = QVBoxLayout(); left_col.setSpacing(3)
+        left_col = QVBoxLayout(); left_col.setSpacing(2)
         crumb = QLabel("PEOPLE   ·   IDEAS   ·   A BRIGHTER TOMORROW")
-        crumb.setFont(mono_font(7))
-        crumb.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; letter-spacing: 1px;")
+        crumb.setFont(mono_font(6))
+        crumb.setStyleSheet(
+            f"color: {C.TEXT_DIM}; background: transparent; letter-spacing: 1px;"
+        )
         left_col.addWidget(crumb)
 
         left_row = QHBoxLayout(); left_row.setSpacing(6)
         self._drawer_btn = QPushButton("⚙")
-        self._drawer_btn.setFixedSize(24, 24)
-        self._drawer_btn.setFont(mono_font(10))
+        self._drawer_btn.setFixedSize(18, 18)
+        self._drawer_btn.setFont(mono_font(8))
         self._drawer_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._drawer_btn.setToolTip("Settings & Controls")
         self._drawer_btn.setStyleSheet(f"""
             QPushButton {{
                 background: transparent; color: {C.TEXT_DIM};
-                border: 1px solid {C.BORDER}; border-radius: 12px;
+                border: 1px solid {C.BORDER}; border-radius: 9px;
             }}
             QPushButton:hover {{ color: {C.PRI}; border-color: {C.PRI_DIM}; }}
             QPushButton:checked {{ color: {C.PRI}; border-color: {C.PRI}; background: {C.PRI_GHO}; }}
@@ -3981,30 +4119,30 @@ class MainWindow(QMainWindow):
         mid_frame = _WordmarkFrame()
         mid_frame.setStyleSheet("background: transparent;")
         mid = QVBoxLayout(mid_frame)
-        mid.setContentsMargins(28, 5, 28, 7)
-        mid.setSpacing(2)
+        mid.setContentsMargins(36, 3, 36, 4)
+        mid.setSpacing(1)
         mid.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         _disp = self._assistant_name.upper()
         _spaced = " ".join(list(_disp))
         self._title_lbl = QLabel(_spaced)
         self._title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._title_lbl.setFont(mono_font(18, QFont.Weight.Bold))
+        self._title_lbl.setFont(mono_font(15, QFont.Weight.Bold))
         self._title_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
         mid.addWidget(self._title_lbl)
         self._sub_lbl = QLabel("AI FOR A BRIGHTER TOMORROW")
         self._sub_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._sub_lbl.setFont(mono_font(7))
+        self._sub_lbl.setFont(mono_font(6))
         self._sub_lbl.setStyleSheet(f"color: {C.PRI_DIM}; background: transparent; letter-spacing: 1px;")
         mid.addWidget(self._sub_lbl)
         lay.addWidget(mid_frame)
         lay.addStretch(1)
 
         # ── right: date/time + tagline + avatar ─────────────────────────────
-        right_row = QHBoxLayout(); right_row.setSpacing(18)
+        right_row = QHBoxLayout(); right_row.setSpacing(12)
 
-        right_col = QVBoxLayout(); right_col.setSpacing(2)
+        right_col = QVBoxLayout(); right_col.setSpacing(1)
         self._date_lbl = QLabel("")
-        self._date_lbl.setFont(mono_font(7, QFont.Weight.Bold))
+        self._date_lbl.setFont(mono_font(6, QFont.Weight.Bold))
         self._date_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent; letter-spacing: 1px;")
         self._date_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
         right_col.addWidget(self._date_lbl)
@@ -4012,30 +4150,30 @@ class MainWindow(QMainWindow):
         clock_row = QHBoxLayout(); clock_row.setSpacing(6)
         clock_row.addStretch()
         self._clock_lbl = QLabel("00:00")
-        self._clock_lbl.setFont(mono_font(15, QFont.Weight.Bold))
+        self._clock_lbl.setFont(mono_font(13, QFont.Weight.Bold))
         self._clock_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
         self._clock_ampm_lbl = QLabel("AM")
-        self._clock_ampm_lbl.setFont(mono_font(11, QFont.Weight.Bold))
+        self._clock_ampm_lbl.setFont(mono_font(9, QFont.Weight.Bold))
         self._clock_ampm_lbl.setStyleSheet(f"color: {C.ACC}; background: transparent;")
         clock_row.addWidget(self._clock_lbl)
         clock_row.addWidget(self._clock_ampm_lbl)
         right_col.addLayout(clock_row)
         right_row.addLayout(right_col)
 
-        tag_col = QVBoxLayout(); tag_col.setSpacing(6)
+        tag_col = QVBoxLayout(); tag_col.setSpacing(4)
         t1 = QLabel("STAY CURIOUS")
-        t1.setFont(mono_font(6, QFont.Weight.Bold))
+        t1.setFont(mono_font(5, QFont.Weight.Bold))
         t1.setAlignment(Qt.AlignmentFlag.AlignRight)
         t1.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; letter-spacing: 1px;")
         tag_col.addWidget(t1)
 
         avatar = QLabel("i")
-        avatar.setFixedSize(28, 28)
+        avatar.setFixedSize(24, 24)
         avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
         avatar.setFont(mono_font(9, QFont.Weight.Bold))
         avatar.setStyleSheet(
             f"color: {C.PRI}; background: {C.PANEL2}; "
-            f"border: 1px solid {C.BORDER_B}; border-radius: 14px;"
+            f"border: 1px solid {C.BORDER_B}; border-radius: 12px;"
         )
         av_row = QHBoxLayout(); av_row.addStretch(); av_row.addWidget(avatar)
         tag_col.addLayout(av_row)
@@ -4056,15 +4194,16 @@ class MainWindow(QMainWindow):
     def _build_left_panel(self) -> QWidget:
         w = QWidget()
         w.setFixedWidth(_LEFT_W)
-        # Floating glass panel — translucent black, not an opaque sidebar, so
-        # the central Mindboxx art stays faintly visible through it.
+        # The target uses a compact, floating black-glass rail. Keep the
+        # existing metrics and data bindings; only the presentation changes.
         w.setStyleSheet(
-            "background: rgba(0,0,0,0.30); "
-            "border-right: 1px solid rgba(255,255,255,0.10);"
+            "background: rgba(6,6,6,0.72); "
+            "border: 1px solid rgba(255,255,255,0.14); "
+            "border-radius: 10px;"
         )
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(10, 18, 10, 14)
-        lay.setSpacing(10)
+        lay.setContentsMargins(8, 10, 8, 10)
+        lay.setSpacing(8)
 
         # Four AUREX-style status cards. Underlying data sources are kept
         # identical to the original CPU/MEM/NET/GPU/TMP feed (_update_metrics
@@ -4083,8 +4222,8 @@ class MainWindow(QMainWindow):
 
         info_panel = QWidget()
         info_panel.setStyleSheet(
-            "background: rgba(15,15,15,0.55); "
-            "border: 1px solid rgba(255,255,255,0.10); border-radius: 8px;"
+            "background: rgba(8,8,8,0.64); "
+            "border: 1px solid rgba(255,255,255,0.11); border-radius: 8px;"
         )
         ip_lay = QVBoxLayout(info_panel)
         ip_lay.setContentsMargins(8, 6, 8, 6)
@@ -4123,12 +4262,13 @@ class MainWindow(QMainWindow):
         w = QWidget()
         w.setFixedWidth(_RIGHT_W)
         w.setStyleSheet(
-            "background: rgba(0,0,0,0.30); "
-            "border-left: 1px solid rgba(255,255,255,0.10);"
+            "background: rgba(6,6,6,0.72); "
+            "border: 1px solid rgba(255,255,255,0.14); "
+            "border-radius: 10px;"
         )
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(8, 8, 8, 8)
-        lay.setSpacing(6)
+        lay.setContentsMargins(8, 9, 8, 8)
+        lay.setSpacing(5)
 
         def _sec(txt):
             l = QLabel(f"▸ {txt}")
@@ -4168,7 +4308,10 @@ class MainWindow(QMainWindow):
         self._file_hint.setFont(mono_font(7))
         self._file_hint.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
         self._file_hint.setWordWrap(True)
-        lay.addWidget(self._file_hint)
+        # The reference keeps the upload module compact. Upload feedback still
+        # goes to the stream; the extra hint is retained for compatibility but
+        # kept out of the default composition.
+        self._file_hint.setVisible(False)
 
         sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.HLine)
         sep2.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
@@ -4178,32 +4321,31 @@ class MainWindow(QMainWindow):
         # matching the single "Ask <name> anything…" input in the reference.
 
         self._interrupt_btn = QPushButton("✋  INTERRUPT  [ESC]")
-        self._interrupt_btn.setFixedHeight(36)
-        self._interrupt_btn.setFont(mono_font(8, QFont.Weight.Bold))
+        self._interrupt_btn.setFixedHeight(29)
+        self._interrupt_btn.setFont(mono_font(7, QFont.Weight.Bold))
         self._interrupt_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._interrupt_btn.setStyleSheet(f"""
             QPushButton {{
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #2a1608, stop:1 #180d04);
-                color: {C.ACC};
-                border: 1px solid {C.ACC}; border-radius: 8px;
+                background: rgba(14,14,14,0.9);
+                color: {C.TEXT_MED};
+                border: 1px solid rgba(255,138,61,0.75); border-radius: 7px;
                 letter-spacing: 1px;
             }}
             QPushButton:hover {{
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #3a1e0a, stop:1 #201004);
+                background: rgba(28,18,12,0.92);
                 border: 1px solid {C.ACC2};
+                color: {C.PRI};
             }}
             QPushButton:pressed {{
-                background: #4a2610;
+                background: rgba(50,26,12,0.92);
             }}
         """)
         self._interrupt_btn.clicked.connect(self._do_interrupt)
         lay.addWidget(self._interrupt_btn)
 
         self._mute_btn = QPushButton("🎙  MICROPHONE ACTIVE")
-        self._mute_btn.setFixedHeight(32)
-        self._mute_btn.setFont(mono_font(8, QFont.Weight.Bold))
+        self._mute_btn.setFixedHeight(29)
+        self._mute_btn.setFont(mono_font(7, QFont.Weight.Bold))
         self._mute_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._mute_btn.clicked.connect(self._toggle_mute)
         self._style_mute_btn()
@@ -4380,34 +4522,38 @@ class MainWindow(QMainWindow):
     def _build_input_row(self) -> QHBoxLayout:
         row = QHBoxLayout(); row.setSpacing(6)
         self._input = QLineEdit()
-        self._input.setPlaceholderText(f"Ask {self._assistant_name.upper()} anything…")
-        self._input.setFont(mono_font(9))
-        self._input.setFixedHeight(38)
+        self._input.setPlaceholderText(f"Ask {self._assistant_name.upper()} anything...")
+        self._input.setFont(mono_font(8))
+        self._input.setFixedHeight(32)
         self._input.setStyleSheet(f"""
             QLineEdit {{
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #0a1420, stop:1 #060d16);
+                background: rgba(5,5,5,0.82);
                 color: {C.WHITE};
-                border: 1px solid {C.BORDER};
-                border-radius: 12px; padding: 3px 14px;
+                border: 1px solid rgba(255,255,255,0.12);
+                border-radius: 6px; padding: 2px 12px;
             }}
-            QLineEdit:focus {{ border: 1px solid {C.PRI}; background: #0c1826; }}
+            QLineEdit:focus {{
+                border: 1px solid rgba(255,138,61,0.38);
+                background: rgba(8,8,8,0.95);
+            }}
         """)
         self._input.returnPressed.connect(self._send)
         row.addWidget(self._input, stretch=1)
 
         send = QPushButton("▸")
-        send.setFixedSize(38, 38)
-        send.setFont(mono_font(12, QFont.Weight.Bold))
+        send.setFixedSize(32, 32)
+        send.setFont(mono_font(11, QFont.Weight.Bold))
         send.setCursor(Qt.CursorShape.PointingHandCursor)
         send.setStyleSheet(f"""
             QPushButton {{
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 {C.PRI_GHO}, stop:1 {C.PANEL});
+                background: rgba(8,8,8,0.88);
                 color: {C.PRI};
-                border: 1px solid {C.PRI_DIM}; border-radius: 10px;
+                border: 1px solid rgba(255,255,255,0.16); border-radius: 6px;
             }}
-            QPushButton:hover {{ background: {C.PRI_GHO}; border: 1px solid {C.PRI}; }}
+            QPushButton:hover {{
+                background: rgba(26,18,12,0.9);
+                border: 1px solid rgba(255,138,61,0.5);
+            }}
         """)
         send.clicked.connect(self._send)
         row.addWidget(send)
@@ -4523,22 +4669,24 @@ class MainWindow(QMainWindow):
         glowing mic button, a state readout, then the command-input row and
         a thin credit strip."""
         outer = QWidget()
-        outer.setStyleSheet(f"background: {C.DARK}; border-top: 1px solid {C.BORDER};")
+        outer.setStyleSheet(
+            f"background: {C.DARK}; border-top: 1px solid rgba(255,255,255,0.12);"
+        )
         v = QVBoxLayout(outer)
-        v.setContentsMargins(0, 10, 0, 0)
-        v.setSpacing(4)
+        v.setContentsMargins(0, 4, 0, 0)
+        v.setSpacing(1)
 
         # ── waveform + big mic button ────────────────────────────────────────
         mic_row = QHBoxLayout()
-        mic_row.setContentsMargins(40, 0, 40, 0)
-        mic_row.setSpacing(14)
+        mic_row.setContentsMargins(18, 0, 18, 0)
+        mic_row.setSpacing(8)
 
         wave_l = AudioWaveform()
         mic_row.addWidget(wave_l, stretch=1)
 
         self._mic_big_btn = QPushButton("🎙")
-        self._mic_big_btn.setFixedSize(64, 64)
-        self._mic_big_btn.setFont(mono_font(20))
+        self._mic_big_btn.setFixedSize(48, 48)
+        self._mic_big_btn.setFont(mono_font(16))
         self._mic_big_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._mic_big_btn.setToolTip("Mute / unmute microphone  [F4]")
         self._mic_big_btn.clicked.connect(self._toggle_mute)
@@ -4557,30 +4705,31 @@ class MainWindow(QMainWindow):
         # ── state readout ────────────────────────────────────────────────────
         self._state_lbl = QLabel("AWAITING")
         self._state_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._state_lbl.setFont(mono_font(10, QFont.Weight.Bold))
+        self._state_lbl.setFont(mono_font(8, QFont.Weight.Bold))
         self._state_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent; letter-spacing: 3px;")
         v.addWidget(self._state_lbl)
 
         self._state_sub_lbl = QLabel("Tap and speak")
         self._state_sub_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._state_sub_lbl.setFont(mono_font(7))
+        self._state_sub_lbl.setFont(mono_font(6))
         self._state_sub_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
         v.addWidget(self._state_sub_lbl)
 
         # ── command-input row ───────────────────────────────────────────────
         in_row = QHBoxLayout()
-        in_row.setContentsMargins(40, 8, 40, 8)
-        in_row.setSpacing(8)
+        in_row.setContentsMargins(18, 5, 18, 5)
+        in_row.setSpacing(7)
 
         grid_btn = QPushButton("⊞")
-        grid_btn.setFixedSize(38, 38)
-        grid_btn.setFont(mono_font(13))
+        grid_btn.setFixedSize(32, 32)
+        grid_btn.setFont(mono_font(11))
         grid_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         grid_btn.setToolTip("Quick controls")
         grid_btn.setStyleSheet(f"""
             QPushButton {{
                 background: transparent; color: {C.TEXT_DIM};
-                border: 1px solid {C.BORDER}; border-radius: 10px;
+                background: rgba(8,8,8,0.88);
+                border: 1px solid rgba(255,255,255,0.12); border-radius: 6px;
             }}
             QPushButton:hover {{ color: {C.PRI}; border-color: {C.PRI_DIM}; }}
         """)
@@ -4594,8 +4743,10 @@ class MainWindow(QMainWindow):
 
         # ── thin credit / shortcuts strip ───────────────────────────────────
         strip = QWidget()
-        strip.setFixedHeight(20)
-        strip.setStyleSheet(f"background: {C.DARK}; border-top: 1px solid {C.BORDER};")
+        strip.setFixedHeight(18)
+        strip.setStyleSheet(
+            f"background: {C.DARK}; border-top: 1px solid rgba(255,255,255,0.08);"
+        )
         s_lay = QHBoxLayout(strip); s_lay.setContentsMargins(14, 0, 14, 0)
 
         def _fl(txt, color=C.TEXT_MED):
@@ -5182,7 +5333,7 @@ class MainWindow(QMainWindow):
                     background: qradialgradient(cx:0.5, cy:0.5, radius:0.8,
                         fx:0.5, fy:0.5, stop:0 #2a0410, stop:1 #0c0106);
                     color: {C.MUTED_C};
-                    border: 2px solid {C.MUTED_C}; border-radius: 32px;
+                    border: 1px solid {C.MUTED_C}; border-radius: 24px;
                 }}
                 QPushButton:hover {{ background: #350414; }}
             """)
@@ -5192,7 +5343,7 @@ class MainWindow(QMainWindow):
                     background: qradialgradient(cx:0.5, cy:0.5, radius:0.8,
                         fx:0.5, fy:0.5, stop:0 {C.PRI_GHO}, stop:1 {C.DARK});
                     color: {C.PRI};
-                    border: 2px solid {C.PRI_DIM}; border-radius: 32px;
+                    border: 1px solid {C.PRI_DIM}; border-radius: 24px;
                 }}
                 QPushButton:hover {{ border-color: {C.PRI}; }}
             """)
