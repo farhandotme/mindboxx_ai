@@ -11,6 +11,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -151,25 +152,71 @@ def _get_camera_index() -> int:
     return _detect_camera_index()
 
 
-def _capture_camera() -> tuple[bytes, str]:
+_shared_camera_manager = None   # a core.camera_manager.CameraManager, set once at startup
+
+
+def set_shared_camera_manager(mgr) -> None:
+    """Called once by main.py at startup so on-demand vision snapshots reuse
+    the SAME physical camera stream CameraManager keeps open in the
+    background, instead of opening a second, competing VideoCapture. This is
+    the single-camera-owner architecture: there is exactly one place in the
+    whole app that calls cv2.VideoCapture(...) for the webcam now."""
+    global _shared_camera_manager
+    _shared_camera_manager = mgr
+
+
+def get_shared_camera_manager():
+    """The one CameraManager instance for the whole app, or None if it was
+    never registered (camera feature unavailable / never started). Anything
+    else in the app that wants a webcam frame -- including the UI's
+    "look at my camera" preview stream -- should pull from here instead of
+    ever calling cv2.VideoCapture itself. See the ABSOLUTE RULE in
+    core/camera_manager.py: there must be exactly one physical camera owner."""
+    return _shared_camera_manager
+
+
+def _grab_camera_frame():
+    """A raw BGR frame from the shared CameraManager -- the one and only
+    physical camera owner in the app. Briefly waits/retries against it
+    rather than ever opening a second, competing VideoCapture: two handles
+    on the same physical webcam index fight each other on most drivers,
+    which is exactly the old "camera is not opening all the time" bug this
+    architecture exists to fix (see core/camera_manager.py).
+
+    Only falls back to a one-off legacy open when NO shared manager was ever
+    registered at all -- i.e. the always-on camera feature itself is off or
+    unavailable in this run, so there is no owner to contend with."""
+    if _shared_camera_manager is not None:
+        # The manager reads at up to ~12 fps; give it a couple of retries
+        # across a brief reconnect/stall rather than immediately falling
+        # through to a second capture handle.
+        for _ in range(6):
+            frame = _shared_camera_manager.get_latest_frame(max_age=3.0)
+            if frame is not None:
+                return frame
+            time.sleep(0.25)
+        raise RuntimeError("Camera has no recent frame yet (reconnecting?). Try again shortly.")
+
     if not _CV2:
         raise RuntimeError("OpenCV (cv2) is not installed. Run: pip install opencv-python")
 
     index   = _get_camera_index()
     backend = _cv2_backend()
-    cap     = cv2.VideoCapture(index, backend)
-
+    cap = cv2.VideoCapture(index, backend)
     if not cap.isOpened():
+        cap.release()
         raise RuntimeError(f"Camera index {index} could not be opened.")
-
     for _ in range(10):
         cap.read()
-
     ret, frame = cap.read()
     cap.release()
-
     if not ret or frame is None:
         raise RuntimeError("Camera returned no frame.")
+    return frame
+
+
+def _capture_camera() -> tuple[bytes, str]:
+    frame = _grab_camera_frame()
 
     if _PIL:
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
