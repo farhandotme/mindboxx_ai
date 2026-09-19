@@ -19,6 +19,7 @@ pygetwindow
 pillow
 opencv-python
 mss
+mediapipe   # human presence detection (core/presence.py) -- pose + face landmarks
 
 # ── System, files & documents ─────────────────────────────────────────────────
 psutil
