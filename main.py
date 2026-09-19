@@ -61,15 +61,12 @@ from memory.memory_manager import (
 # Only tools that are tied to live-session state stay inline in this file
 # (screen_process, close_camera, save_memory, manage_monitor, shutdown_AUREX,
 # system_status).
-from actions.screen_processor  import _capture_camera, _capture_screen
-from actions.system_monitor    import SystemMonitor, get_system_status
-from actions.proactive         import ProactiveEngine
-from actions.background_monitor import (
-    add_monitor, remove_monitor, list_monitors, check_all as monitor_check_all,
-)
-from actions.web_search        import _news as _fetch_news_sync
+from actions.screen_processor  import _capture_camera, _capture_screen, set_shared_camera_manager
+from actions.system_monitor    import get_system_status
+from actions.background_monitor import add_monitor, remove_monitor, list_monitors
 from memory.config_manager     import (
-    get_brief_enabled, get_voice, get_wake_word_enabled, save_wake_word_enabled,    get_input_device, get_output_device,
+    get_voice, get_wake_word_enabled, save_wake_word_enabled, get_input_device, get_output_device,
+    get_presence_enabled, save_presence_enabled,
 )
 from core.plugin_loader        import discover_plugins
 from core                      import undo as undo_stack
@@ -79,6 +76,12 @@ from core.action_loader        import discover_actions
 from core.wake_word            import (
     WakeWordDetector, is_ready as wake_is_ready, install_and_download as wake_install,
 )
+from core.presence             import PresenceDetector, is_available as presence_is_available, \
+    unavailable_reason as presence_unavailable_reason
+from core.camera_manager       import CameraManager, is_available as camera_is_available
+from core.kiosk_state          import KioskState, KioskStateMachine
+from core.identity_manager     import IdentityManager
+from core.tts                  import create_tts_player, TTSPlayer
 
 # How long the assistant stays awake with no user speech before it auto-sleeps
 # again (wake-word mode only).
@@ -112,8 +115,21 @@ _LEVEL_FULL  = 2600.0
 # a cough, or speaker bleed) for several consecutive frames in a row before
 # we treat it as an interruption. _BARGE_IN_FRAMES × CHUNK_SIZE/SEND_SAMPLE_RATE
 # is roughly the reaction time — tuned to feel instant without being twitchy.
-_BARGE_IN_LEVEL  = 0.5
-_BARGE_IN_FRAMES = 3
+#
+# Tuned against the "Interrupted — listening..." loop: laptop speakers bleed
+# AUREX's own voice into the mic, and the old 3-frame / fixed-level trigger read
+# that echo as the user talking over it — AUREX cut itself off, heard its own
+# tail, answered it, cut itself off again. Now the trigger (a) ignores the first
+# second of every reply while it measures how loud the echo is, (b) needs the mic
+# to clearly beat that measured echo level, for ~0.5 s in a row, and (c) can only
+# fire once per _BARGE_IN_COOLDOWN.
+_BARGE_IN_LEVEL    = 0.55   # absolute floor for "the user is talking over me"
+_BARGE_IN_FRAMES   = 8      # 8 x 64 ms ≈ 0.5 s of sustained loud audio
+_BARGE_IN_GRACE    = 1.0    # s after a reply starts: learn the echo level, never interrupt
+_BARGE_IN_MARGIN   = 1.8    # mic level must exceed measured echo peak x this
+_BARGE_IN_COOLDOWN = 2.0    # s between two voice-triggered interrupts
+_POST_SPEECH_MIC_HOLD  = 0.4   # s of mic silence after AUREX finishes talking (speaker tail)
+_INTERRUPT_DISCARD_MAX = 6.0   # s: never keep discarding model audio longer than this
 
 
 def _pcm_level(samples) -> float:
@@ -392,6 +408,16 @@ class AUREXLive:
         self._vision_busy          = False   # True while a vision capture/inject cycle is in flight
         self._interrupted          = False   # True while draining audio after user interrupt
         self._barge_in_streak      = 0       # consecutive loud mic frames while AUREX is speaking
+        self._echo_peak            = 0.0     # measured loudness of AUREX's own voice inside the mic
+        self._speaking_since       = 0.0     # monotonic time the current reply started playing
+        self._interrupted_at       = 0.0     # when the discard-incoming-audio flag was armed
+        self._last_interrupt_ts    = 0.0     # last accepted interrupt (voice cooldown)
+        self._mic_hold_until       = 0.0     # mic frames are not sent before this (speaker tail)
+        self._loop_thread_id       = None    # thread id of the asyncio loop
+        self._greeting_pending     = False   # someone arrived before the Live session was ready
+        self._shutdown_started     = False
+        self._turn_open            = False   # model has started a reply and turn_complete hasn't arrived yet
+        self._expect_reply_until   = 0.0     # we just sent something that will get a reply — until this time
         self.ui.on_text_command   = self._on_text_command
         self.ui.on_remote_clicked = self._make_remote_key
         self.ui.on_interrupt      = self.interrupt
@@ -417,9 +443,6 @@ class AUREXLive:
         self._resume_handle: str | None = None
         self._turn_done_event: asyncio.Event | None = None
         self._dashboard     = None
-        self._briefing_sent    = False          # morning briefing fires once per process
-        self._sys_monitor      = SystemMonitor()  # persistent cooldown state
-        self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
 
@@ -448,11 +471,65 @@ class AUREXLive:
         self.ui.get_plugin_settings = self._plugin_registry.settings_schemas  # ⚙ settings tab
         self.ui.request_say = self.plugin_say   # plugins: mid-task speech channel
 
-        # ── Wake word ────────────────────────────────────────────────────────
-        # _awake gates the mic (see _listen_audio) and the background speakers.
-        # It is True whenever wake word is OFF, so default behaviour is unchanged.
+        # ── Kiosk state machine ──────────────────────────────────────────────
+        # The single source of truth for AUREX's kiosk behaviour:
+        #   IDLE -> APPROACHING -> GREETING -> CONVERSATION -> DEPARTING -> IDLE
+        # Nothing else (presence, wake word, the UI) flips _awake / mic /
+        # speaking directly — they only ever request a transition here, and
+        # the on_enter handlers below are what actually wake, greet, gate the
+        # mic, interrupt speech, and put AUREX back to sleep. See core/kiosk_state.py.
+        self._kiosk = KioskStateMachine(
+            logger=lambda m: (print(f"[Kiosk] {m}"), self.ui.write_log(f"SYS: {m}"))
+        )
+        self._kiosk.on_enter(KioskState.APPROACHING,  self._kiosk_on_approaching)
+        self._kiosk.on_enter(KioskState.GREETING,     self._kiosk_on_greeting)
+        self._kiosk.on_enter(KioskState.CONVERSATION, self._kiosk_on_conversation)
+        self._kiosk.on_enter(KioskState.DEPARTING,    self._kiosk_on_departing)
+        self.ui.kiosk_get_state = lambda: self._kiosk.state.value   # for logs/settings only
+
+        # Who's currently at the desk — separate from "is someone here"
+        # (that's presence detection). See core/identity_manager.py.
+        self._identity = IdentityManager(
+            logger=lambda m: (print(f"[Identity] {m}"), self.ui.write_log(f"SYS: {m}"))
+        )
+
+        # ── Deterministic local greeting voice (item 5) ──────────────────────
+        # The very FIRST thing AUREX says to an arriving person must NEVER
+        # depend on the Gemini Live session — not on it being connected, not
+        # on the model deciding to respond, not on the network being fast.
+        # This is a second, completely independent TTS engine (same engine
+        # choices — EdgeTTS/Kokoro/ElevenLabs — as the rest of the app uses
+        # via core/tts.py) whose ONLY job is to speak a fixed "Good
+        # morning."/"Good afternoon."/etc. the instant a human is confirmed
+        # present. It is built once, in the background, at launch — well
+        # before anyone can walk up — so it's warm the first time it's
+        # needed. See _build_greeting_tts / _speak_deterministic_greeting
+        # and _kiosk_on_greeting below.
+        self._greeting_tts: TTSPlayer | None = None
+        self._greeting_tts_lock = threading.Lock()
+        self._pending_deterministic_greeting: str = ""
+        threading.Thread(
+            target=self._build_greeting_tts, daemon=True, name="GreetingTTSInit"
+        ).start()
+
+        # ── Camera: one owner for the whole app ──────────────────────────────
+        # Opened once, held open, read continuously in the background; both
+        # presence detection and the on-demand vision tool read its cached
+        # latest frame instead of opening their own VideoCapture. Started in
+        # run() (once, independent of Gemini reconnects) and stopped only at
+        # process shutdown. See core/camera_manager.py.
+        self._camera: CameraManager | None = None
+        if camera_is_available():
+            self._camera = CameraManager(
+                logger=lambda m: (print(f"[Camera] {m}"), self.ui.write_log(f"SYS: {m}"))
+            )
+            set_shared_camera_manager(self._camera)
+
+        # ── Wake word (voice trigger) ─────────────────────────────────────────
+        # Optional, alongside the camera: "Hey AUREX" also drives the SAME
+        # kiosk state machine as a person walking up does — one path in, one
+        # set of consequences (see _on_wake_detected below).
         self._wake_enabled     = get_wake_word_enabled()
-        self._awake            = not self._wake_enabled
         self._wake_detector: WakeWordDetector | None = None
         self._wake_sleep_timeout = WAKE_SLEEP_TIMEOUT
         # UI control surface for the Wake Word settings section.
@@ -461,6 +538,28 @@ class AUREXLive:
         self.ui.on_wake_toggle   = self._ui_wake_toggle   # (enable: bool) -> str
         self.ui.on_wake_manual   = self._ui_wake_manual   # () -> toggle awake/asleep
         self.ui.on_wake_install  = self._ui_wake_install  # () -> (ok, msg)
+
+        # ── Ambient presence sensor ──────────────────────────────────────────
+        # "Someone just walked up to the desk" — runs locally, hidden, never
+        # displayed or saved (see core/presence.py). Feeds the kiosk state
+        # machine above; the camera itself is owned by CameraManager, not by
+        # this detector.
+        self._presence_enabled  = get_presence_enabled() and presence_is_available() and self._camera is not None
+        if get_presence_enabled() and not presence_is_available():
+            print(f"[Presence] disabled -- {presence_unavailable_reason()}")
+        self._presence_detector: PresenceDetector | None = None
+        self.ui.presence_get_state = self._presence_state      # () -> dict, for UI/log use
+        self.ui.on_presence_toggle = self._ui_presence_toggle  # (enable: bool) -> str
+
+        # Kiosk mode is "on" the moment either sensor can wake AUREX up.
+        # In that mode _awake starts False (silent, mic gated) and ONLY the
+        # kiosk state machine's GREETING/DEPARTING handlers ever flip it —
+        # see _kiosk_on_greeting / _kiosk_on_departing below.
+        # With BOTH off, kiosk choreography is skipped entirely and AUREX
+        # behaves like a classic always-on desktop assistant (unchanged
+        # default behaviour for anyone not using the kiosk features).
+        self._kiosk_mode = self._wake_enabled or self._presence_enabled
+        self._awake = not self._kiosk_mode
 
     # ── Wake word: state machine ─────────────────────────────────────────────
 
@@ -482,10 +581,17 @@ class AUREXLive:
         return True
 
     def _on_wake_detected(self) -> None:
-        """Called from the detector thread when 'Hey AUREX' is heard."""
-        self.wake(reason="wake word")
+        """Called from the detector thread when 'Hey AUREX' is heard. Feeds
+        the SAME kiosk state machine a camera arrival does — see
+        _kiosk_on_approaching/_kiosk_on_greeting below for what happens next.
+        A no-op if we're already past IDLE (e.g. mid-conversation)."""
+        self._kiosk.transition(KioskState.APPROACHING, "wake word heard")
 
     def wake(self, reason: str = "wake word") -> None:
+        """Internal primitive — only ever called from within a kiosk
+        on_enter handler (see _kiosk_on_greeting). Flips the mic/UI to
+        listening; nothing outside the kiosk state machine should call this
+        directly."""
         if self._awake:
             return
         self._awake = True
@@ -495,25 +601,33 @@ class AUREXLive:
         self.ui.write_log(f"SYS: Awake — {reason}.")
 
     def sleep(self, reason: str = "timeout") -> None:
+        """Internal primitive — only ever called from within a kiosk
+        on_enter handler (see _kiosk_on_departing). Gates the mic back off."""
         if not self._awake:
             return
         self._awake = False
         self.set_speaking(False)
         self.ui.set_state("SLEEPING")
-        self.ui.write_log(f"SYS: Sleeping — {reason}. Say 'Hey AUREX' to wake me.")
+        self.ui.write_log(f"SYS: Sleeping — {reason}.")
 
     async def _run_sleep_watch(self) -> None:
-        """Auto-sleep after the configured silence window (wake-word mode only)."""
+        """
+        Silence-timeout fallback for voice-only wake mode (wake word ON,
+        presence camera not driving departure). When the camera IS active,
+        PresenceDetector's own departure debounce is authoritative — walking
+        away is what ends the conversation, not a clock — so this stays out
+        of the way entirely in that case.
+        """
         while True:
             await asyncio.sleep(5)
-            if not self._wake_enabled or not self._awake:
+            if not self._wake_enabled or self._presence_enabled or not self._awake:
                 continue
             with self._speaking_lock:
                 speaking = self._is_speaking
             if speaking:
                 continue
             if (time.monotonic() - self._last_user_speech) > self._wake_sleep_timeout:
-                self.sleep(reason="no speech for 2 minutes")
+                self._kiosk.transition(KioskState.DEPARTING, "no speech for 2 minutes")
 
     # ── Wake word: UI callbacks (called from the Qt thread) ──────────────────
 
@@ -524,28 +638,335 @@ class AUREXLive:
             if not wake_is_ready():
                 return "need_download"
             self._wake_enabled = True
+            self._kiosk_mode = True
             save_wake_word_enabled(True)
             self._ensure_wake_detector()
+            self._kiosk.force_idle("wake word enabled")
             self.sleep(reason="wake word enabled")
             return "enabled"
         else:
             self._wake_enabled = False
+            self._kiosk_mode = self._presence_enabled
             save_wake_word_enabled(False)
-            self.wake(reason="wake word disabled")
+            if not self._kiosk_mode:
+                self._kiosk.force_idle("wake word disabled")
+                self.wake(reason="wake word disabled")
             return "disabled"
 
     def _ui_wake_manual(self) -> None:
-        """Manual sleep/wake button in the UI."""
+        """Manual sleep/wake button in the UI — goes straight through the
+        kiosk state machine so it can't drift out of sync with it."""
         if not self._wake_enabled:
             return
         if self._awake:
-            self.sleep(reason="you tapped sleep")
+            self._kiosk.transition(KioskState.DEPARTING, "you tapped sleep")
         else:
-            self.wake(reason="you tapped wake")
+            self._kiosk.transition(KioskState.APPROACHING, "you tapped wake")
 
     def _ui_wake_install(self) -> tuple[bool, str]:
         """Download openwakeword + the model (runs in a UI worker thread)."""
         return wake_install(logger=lambda m: self.ui.write_log(f"SYS: {m}"))
+
+    # ── Presence sensor: state machine ────────────────────────────────────────
+
+    def _presence_state(self) -> dict:
+        det = self._presence_detector
+        return {
+            "enabled": self._presence_enabled,
+            "ready":   bool(det and det.ready),
+            "present": bool(det and det.present),
+        }
+
+    def _ensure_presence_detector(self) -> bool:
+        """Load the detector once and start its polling thread. Idempotent."""
+        if not self._presence_enabled or self._camera is None:
+            return False
+        if self._presence_detector is None:
+            self._presence_detector = PresenceDetector(
+                camera=self._camera,
+                on_arrived=self._on_person_arrived,
+                on_left=self._on_person_left,
+                logger=lambda m: (print(f"[Presence] {m}"), self.ui.write_log(f"SYS: {m}")),
+            )
+        if not self._presence_detector.ready:
+            return self._presence_detector.start()
+        return True
+
+    def _on_person_arrived(self) -> None:
+        """Called from the presence-detector's own background thread the
+        moment someone is confirmed standing at the desk. Only asks the
+        kiosk state machine for a transition — IDLE -> APPROACHING — it
+        never touches _awake/wake/sleep directly (see kiosk on_enter
+        handlers below for what actually happens next)."""
+        self._kiosk.transition(KioskState.APPROACHING, "someone stepped up to the desk")
+
+    def _on_person_left(self) -> None:
+        """Called from the presence-detector thread once nobody's been at
+        the desk for the debounce window. Picks the right target state
+        depending on how far the interaction had gotten — someone who
+        wandered off before the greeting even started just goes back to
+        IDLE quietly; someone who was mid-conversation triggers a full,
+        immediate DEPARTING cleanup (item 7: never keep talking to an
+        empty room)."""
+        state = self._kiosk.state
+        if state == KioskState.APPROACHING:
+            self._kiosk.transition(KioskState.IDLE, "left before the greeting started")
+        elif state in (KioskState.GREETING, KioskState.CONVERSATION):
+            self._kiosk.transition(KioskState.DEPARTING, "no longer detected at the desk")
+
+    def _ui_presence_toggle(self, enable: bool) -> str:
+        """Settings-drawer toggle, mirrors _ui_wake_toggle. Returns a status
+        token: 'enabled' | 'disabled' | 'unavailable'."""
+        if enable:
+            if not presence_is_available() or self._camera is None:
+                return "unavailable"
+            self._presence_enabled = True
+            self._kiosk_mode = True
+            save_presence_enabled(True)
+            self._ensure_presence_detector()
+            self._kiosk.force_idle("presence sensor enabled")
+            self.sleep(reason="presence sensor enabled")
+            return "enabled"
+        else:
+            self._presence_enabled = False
+            self._kiosk_mode = self._wake_enabled
+            save_presence_enabled(False)
+            if self._presence_detector:
+                self._presence_detector.stop()
+            if not self._kiosk_mode:
+                self._kiosk.force_idle("presence sensor disabled")
+                self.wake(reason="presence sensor disabled")
+            return "disabled"
+
+    # ── Deterministic local greeting (item 5) ─────────────────────────────────
+
+    def _build_greeting_tts(self) -> None:
+        """Builds the local TTS engine used ONLY for the guaranteed first
+        greeting, in the background, so it's already warm before anyone can
+        possibly walk up. Best-effort: if it fails (engine package missing,
+        no internet for a first-time Kokoro/EdgeTTS use, etc.) the
+        deterministic opener is silently skipped for this run rather than
+        crashing anything — _speak_deterministic_greeting() just no-ops."""
+        try:
+            cfg = {}
+            try:
+                cfg = json.loads(open(API_CONFIG_PATH, encoding="utf-8").read())
+            except Exception:
+                pass
+            player = create_tts_player(cfg)
+            with self._greeting_tts_lock:
+                self._greeting_tts = player
+            print("[Kiosk] Deterministic greeting voice ready.")
+        except Exception as e:
+            print(f"[Kiosk] Deterministic greeting voice unavailable — {e}")
+
+    def _speak_deterministic_greeting(self) -> None:
+        """Item 5, verbatim: 'When PERSON_ARRIVED happens, AUREX must
+        immediately speak using the reliable local TTS/audio system... This
+        first sentence is deterministic... It must happen even when Gemini
+        is reconnecting/slow/failing.' Called synchronously from
+        _kiosk_on_greeting the instant GREETING is entered — but the actual
+        (blocking) TTS call runs on its own thread so it never stalls the
+        presence/wake-word thread that triggered the transition.
+
+        The chosen phrase is stashed in self._pending_deterministic_greeting
+        so _fire_greeting's instruction to Gemini can tell it not to repeat
+        the same opener a second time."""
+        hour = datetime.now().hour
+        if 5 <= hour < 12:
+            text = "Good morning."
+        elif 12 <= hour < 17:
+            text = "Good afternoon."
+        elif 17 <= hour < 22:
+            text = "Good evening."
+        else:
+            text = "Hello."
+        self._pending_deterministic_greeting = text
+
+        def _run():
+            with self._greeting_tts_lock:
+                player = self._greeting_tts
+            if player is None:
+                # Still loading (very first arrival right after launch) or
+                # failed to build — the person is not left in total silence:
+                # Gemini's own greeting (see _fire_greeting) is still queued
+                # right behind this and will speak as soon as it can.
+                print("[Kiosk] Deterministic greeting voice not ready yet — skipping local opener this time.")
+                return
+            try:
+                self.set_speaking(True)
+                player.speak(text)
+            except Exception as e:
+                print(f"[Kiosk] Deterministic greeting playback error — {e}")
+            finally:
+                self.set_speaking(False)
+
+        threading.Thread(target=_run, daemon=True, name="DeterministicGreeting").start()
+
+    def _stop_deterministic_greeting(self) -> None:
+        """Called from _kiosk_on_departing: if the local opener is still
+        mid-sentence when the person walks away, cut it off immediately —
+        same "never keep talking to an empty room" guarantee as the Gemini
+        audio path (see interrupt())."""
+        with self._greeting_tts_lock:
+            player = self._greeting_tts
+        if player is not None:
+            try:
+                player.stop()
+            except Exception:
+                pass
+
+    # ── Kiosk state machine: on_enter handlers ────────────────────────────────
+    # These are the ONLY places _awake, mic gating, speaking, and greeting
+    # speech are triggered as a consequence of presence/wake activity. Both
+    # PresenceDetector and WakeWordDetector only ever call
+    # self._kiosk.transition(...) — everything below is the effect, not the
+    # trigger.
+
+    def _kiosk_on_approaching(self) -> None:
+        """Someone is confirmed at the desk but hasn't been greeted yet. A
+        brief pause lets them settle in frame before the camera-grounded
+        compliment is captured, then we move straight into GREETING."""
+        time.sleep(0.3)
+        self._kiosk.transition(KioskState.GREETING, "starting greeting")
+
+    def _kiosk_on_conversation(self) -> None:
+        """Purely a label — mic/UI state was already flipped by wake() in
+        _kiosk_on_greeting. Kept as its own state (rather than folding into
+        GREETING) so departure logic can tell "still greeting" apart from
+        "already talking" if that distinction is ever needed."""
+        pass
+
+    def _session_ready(self) -> bool:
+        loop = self._loop
+        return bool(self.session is not None and loop is not None and loop.is_running())
+
+    def _kiosk_on_greeting(self) -> None:
+        """Someone is here: wake up and greet them.
+
+        The greeting used to be silently lost in two ways: (1) the person was
+        detected a second or two after launch — BEFORE the Live session had
+        connected — so there was nothing to send it to and the state machine
+        just moved on; (2) a stale "discard model audio" flag armed by the
+        previous departure swallowed the reply. Now the greeting is queued
+        until the session exists, and firing it always disarms that flag.
+
+        Item 5's deterministic opener is fired FIRST and unconditionally —
+        it does not wait on, or care about, _session_ready() at all. That is
+        the actual guarantee: the person hears "Good morning." the instant
+        they're detected, full stop, regardless of what Gemini is doing."""
+        self.wake(reason="starting the greeting")
+        self._speak_deterministic_greeting()
+        self._greeting_pending = True
+        if self._session_ready():
+            self._run_on_loop(self._fire_greeting_after_local_opener())
+        else:
+            self.ui.write_log("SYS: Someone is here — I'll greet them the moment I'm connected.")
+        self._kiosk.transition(KioskState.CONVERSATION, "greeting handed over")
+
+    async def _fire_greeting_after_local_opener(self) -> None:
+        """A small head start before handing off to Gemini, so its audio
+        doesn't land on top of the local "Good morning." at the exact same
+        instant (both use the system's audio output). Purely a polish delay
+        — item 5 only requires the FIRST sentence be independent of Gemini,
+        it says nothing against Gemini continuing naturally right after."""
+        await asyncio.sleep(0.5)
+        self._fire_greeting()
+
+    async def _deliver_pending_greeting(self) -> None:
+        """Runs once per (re)connect: if a person arrived while the session was
+        down, greet them now."""
+        await asyncio.sleep(0.8)          # let the mic/speaker tasks come up first
+        if self._greeting_pending and self._awake and self._session_ready():
+            self._fire_greeting()
+
+    def _fire_greeting(self) -> None:
+        """Build and send exactly ONE greeting turn. No news, no briefing.
+        Runs on the asyncio loop thread."""
+        if not self._greeting_pending or not self._awake:
+            return                       # they already left, or it was already sent
+        self._greeting_pending = False
+
+        # Fresh turn: nothing left over from a previous visit may mute or
+        # talk over this one.
+        self._interrupted = False
+        self._drain_audio()
+        self._mic_hold_until = 0.0
+        self._last_user_speech = time.monotonic()
+
+        name = self._identity.known_name()
+        # The deterministic local opener (item 5) already said this out loud
+        # a moment ago, independent of this very message — reuse the exact
+        # same phrase so the instruction below can tell Gemini not to repeat it.
+        time_greeting = self._pending_deterministic_greeting or "Hello"
+
+        # Last-session continuity, folded into the single greeting.
+        session_clause = ""
+        try:
+            last = pop_last_session()
+            if last:
+                delta = (datetime.now() - datetime.strptime(last["date"], "%Y-%m-%d")).days
+                when = "earlier today" if delta == 0 else ("yesterday" if delta == 1 else f"{delta} days ago")
+                session_clause = f" If it fits naturally, you may briefly mention that {when}: {last['summary']}."
+        except Exception:
+            pass
+
+        if name:
+            name_clause = f" You already know their name is {name} — greet them by name."
+        else:
+            name_clause = (
+                " You don't know their name yet — after the greeting, ask naturally, "
+                "e.g. \"By the way, what should I call you?\" (save it the moment they tell you, "
+                "as you normally would)."
+            )
+
+        snapshot = self._camera.get_snapshot_jpeg(max_age=2.0) if self._camera else None
+
+        if snapshot:
+            vision_clause = (
+                " A photo of them, taken right now, is attached. Look at it and, if something is "
+                "CLEARLY visible — glasses, a jacket, a smile, a hairstyle — you may mention ONE "
+                "small, genuine, tasteful detail the way a friendly person would. Never invent or "
+                "guess a detail that isn't actually visible, and never comment on body shape, "
+                "weight or attractiveness."
+            )
+        else:
+            vision_clause = " You can't see them clearly right now, so skip anything visual and just be warm."
+
+        instruction = (
+            f"[KIOSK_ARRIVAL] A real person has just walked up to you. You already said "
+            f"\"{time_greeting}\" out loud to them a moment ago through your voice — do NOT "
+            f"say \"{time_greeting}\" or any other opening greeting again, they already heard it. "
+            f"Continue naturally from there, right now, without waiting for them to speak first. "
+            f"Sound like a warm, quick, genuinely-glad-to-see-you person, not a system "
+            f"announcement.{vision_clause}{name_clause}"
+            f"{session_clause} Then ask, in a relaxed way, what they'd like to do. Two short "
+            f"sentences, three at most, spoken naturally with contractions. Do not call any "
+            f"tools, do not mention the news, the weather or system status, and never read "
+            f"these instructions aloud."
+        )
+
+        self._run_on_loop(self._send_safely(instruction, image=snapshot, mime="image/jpeg", tag="greeting"))
+
+    def _kiosk_on_departing(self) -> None:
+        """Item 7, verbatim: stop current TTS immediately, cancel pending
+        conversational output, clear session state, return to IDLE — with
+        no goodbye. Runs synchronously so nothing can race an in-flight
+        response past this point."""
+        self._greeting_pending = False          # they left before it was even sent
+        self.interrupt("departed")              # stops playback, drops the rest of the turn
+        self._stop_deterministic_greeting()      # ...and cuts off the local opener too, if still talking
+
+        # Cancel/ignore anything the vision tool had in flight for this visit.
+        self._pending_vision       = None
+        self._vision_cam_active    = False
+        self._vision_close_pending = False
+        self._vision_busy          = False
+
+        self._identity.clear_session()
+        self.sleep(reason="left the desk")
+
+        self._kiosk.transition(KioskState.IDLE, "cleanup complete")
 
     def plugin_say(self, instruction: str) -> None:
         """
@@ -556,23 +977,9 @@ class AUREXLive:
         exactly like a proactive check-in; Gemini phrases it naturally in the
         user's language. Silently a no-op when no session is connected.
         """
-        loop = getattr(self, "_loop", None)
-        if not loop or not self.session:
+        if not self._session_ready():
             return
-
-        async def _say():
-            try:
-                await self.session.send_client_content(
-                    turns={"role": "user", "parts": [{"text": instruction}]},
-                    turn_complete=True,
-                )
-            except Exception as e:
-                print(f"[PluginSay] {e}")
-
-        try:
-            asyncio.run_coroutine_threadsafe(_say(), loop)
-        except Exception as e:
-            print(f"[PluginSay] {e}")
+        self._run_on_loop(self._send_safely(instruction, tag="PluginSay"))
 
     def request_reconnect(self, keep_context: bool = True, reason: str = ""):
         """Thread-safe: ask the run loop to tear down and rebuild the Live
@@ -643,52 +1050,173 @@ class AUREXLive:
         if self._wake_enabled and not self._awake:
             self.ui.write_log("SYS: I'm asleep — say 'Hey AUREX' or tap WAKE NOW first.")
             return
-        asyncio.run_coroutine_threadsafe(
-            self.session.send_client_content(
-                turns={"role": "user", "parts": [{"text": text}]},
-                turn_complete=True
-            ),
-            self._loop
-        )
+        self._run_on_loop(self._send_safely(text, tag="text command"))
 
     def set_speaking(self, value: bool):
         with self._speaking_lock:
+            was = self._is_speaking
             self._is_speaking = value
+        now = time.monotonic()
         if value:
-            self._barge_in_streak = 0   # fresh window each time a new reply starts
+            if not was:                      # a NEW reply started (not every audio chunk)
+                self._barge_in_streak = 0
+                self._echo_peak       = 0.0
+                self._speaking_since  = now
             self.ui.set_state("SPEAKING")
-        elif not self.ui.muted:
-            self.ui.set_state("LISTENING")
+        else:
+            if was:                          # reply just ended: ignore the speaker tail briefly
+                self._mic_hold_until = now + _POST_SPEECH_MIC_HOLD
+            if not self.ui.muted and (self._awake or not self._kiosk_mode):
+                self.ui.set_state("LISTENING")
 
-    def interrupt(self) -> None:
-        """Stop AUREX mid-speech: drain queued audio and open mic immediately."""
-        self._interrupted = True
+    def _drain_audio(self) -> int:
+        """Throw away queued-but-unplayed model audio. Loop-thread only."""
         q = self.audio_in_queue
-        if q:
-            drained = 0
+        drained = 0
+        if q is not None:
             while True:
                 try:
                     q.get_nowait()
                     drained += 1
                 except Exception:
                     break
-            if drained:
-                print(f"[AUREX] ✋ Interrupted — {drained} audio chunks discarded")
+        return drained
+
+    def _stop_playback(self) -> int:
+        """Silence AUREX right now and give the mic back to the user."""
+        drained = self._drain_audio()
         self.set_speaking(False)
+        self._mic_hold_until = 0.0        # the user is (about to be) talking — don't clip them
         if self._turn_done_event:
             self._turn_done_event.clear()
+        return drained
+
+    def interrupt(self, reason: str = "manual") -> None:
+        """Stop AUREX mid-speech. Safe to call from ANY thread (mic callback,
+        Qt thread, presence thread): the real work is always done on the
+        asyncio loop, because the audio queue is not thread-safe.
+
+        reason: "manual"   — ESC / button: always honoured.
+                "barge-in" — user spoke over AUREX: honoured only if AUREX is
+                             actually talking, and at most once per cooldown.
+                "departed" — the person walked away: always honoured, silent."""
+        loop = self._loop
+        if loop is not None and loop.is_running() and threading.get_ident() != self._loop_thread_id:
+            loop.call_soon_threadsafe(self._do_interrupt, reason)
+        else:
+            self._do_interrupt(reason)
+
+    def _turn_in_flight(self) -> bool:
+        return self._turn_open or time.monotonic() < self._expect_reply_until
+
+    def _do_interrupt(self, reason: str = "manual") -> None:
+        now = time.monotonic()
+        with self._speaking_lock:
+            speaking = self._is_speaking
+        q = self.audio_in_queue
+        has_audio = speaking or (q is not None and not q.empty())
+
+        # Nothing to cut off -> do nothing, and above all do NOT arm the
+        # "discard incoming audio" flag: with nothing to cancel, it just
+        # swallowed the NEXT reply (that is how the greeting went missing).
+        if reason == "barge-in":
+            if not has_audio or (now - self._last_interrupt_ts) < _BARGE_IN_COOLDOWN:
+                return
+        elif not (has_audio or self._turn_in_flight()):
+            return
+
+        if reason != "departed":
+            self._last_interrupt_ts = now
+        self._interrupted    = True          # drop the rest of the cancelled turn as it streams in
+        self._interrupted_at = now
+        drained = self._stop_playback()
+
+        if reason == "departed":
+            return
+        if drained:
+            print(f"[AUREX] ✋ Interrupted — {drained} audio chunks discarded")
         self.ui.write_log("SYS: Interrupted — listening...")
 
-    def speak(self, text: str):
-        if not self._loop or not self.session:
+    # ── Sending text / pictures into the Live session ─────────────────────────
+
+    def _call_on_loop(self, fn, *args) -> None:
+        """Run a plain function on the asyncio loop thread, from any thread."""
+        loop = self._loop
+        if loop is None or not loop.is_running():
             return
-        asyncio.run_coroutine_threadsafe(
-            self.session.send_client_content(
-                turns={"role": "user", "parts": [{"text": text}]},
-                turn_complete=True
-            ),
-            self._loop
-        )
+        if threading.get_ident() == self._loop_thread_id:
+            fn(*args)
+        else:
+            loop.call_soon_threadsafe(fn, *args)
+
+    def _run_on_loop(self, coro) -> None:
+        """Schedule a coroutine on the asyncio loop from any thread."""
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            coro.close()
+            return
+        if threading.get_ident() == self._loop_thread_id:
+            loop.create_task(coro)
+        else:
+            asyncio.run_coroutine_threadsafe(coro, loop)
+
+    async def _send_to_model(self, text: str, image: bytes | None = None,
+                             mime: str = "image/jpeg") -> None:
+        """One user turn (optional picture + text) into the Live session.
+
+        gemini-3.1-flash-live takes text and images ONLY through
+        send_realtime_input — send_client_content is limited to seeding the
+        initial history there, and using it mid-conversation gets rejected by
+        the server. Older SDKs/models without those arguments fall back to it."""
+        session = self.session
+        if session is None:
+            return
+        self._expect_reply_until = time.monotonic() + 12.0
+        try:
+            if image:
+                await session.send_realtime_input(video=types.Blob(data=image, mime_type=mime))
+            await session.send_realtime_input(text=text)
+        except (TypeError, AttributeError, ValueError) as e:
+            print(f"[AUREX] realtime text unavailable ({e}) — using client content instead")
+            parts = []
+            if image:
+                parts.append({"inline_data": {"mime_type": mime, "data": image}})
+            parts.append({"text": text})
+            await session.send_client_content(
+                turns={"role": "user", "parts": parts}, turn_complete=True
+            )
+
+    async def _send_safely(self, text: str, image: bytes | None = None,
+                           mime: str = "image/jpeg", tag: str = "send") -> None:
+        try:
+            await self._send_to_model(text, image=image, mime=mime)
+        except Exception as e:
+            print(f"[AUREX] {tag} error: {e}")
+
+    def speak(self, text: str):
+        if not self._session_ready():
+            return
+        self._run_on_loop(self._send_safely(text, tag="speak"))
+
+    def shutdown(self) -> None:
+        """Fast, idempotent, thread-safe teardown (Ctrl+C, window close):
+        release the camera + sensors, and make a best-effort session summary."""
+        if self._shutdown_started:
+            return
+        self._shutdown_started = True
+        self._stop_deterministic_greeting()
+        for part in (self._presence_detector, self._wake_detector, self._camera):
+            try:
+                if part is not None:
+                    part.stop()
+            except Exception as e:
+                print(f"[AUREX] shutdown: {e}")
+        loop = self._loop
+        if loop is not None and loop.is_running() and len(self._session_log) >= 3:
+            try:
+                asyncio.run_coroutine_threadsafe(self._save_session_summary(), loop).result(timeout=2.5)
+            except Exception:
+                pass
 
     def speak_error(self, tool_name: str, error: str):
         short = str(error)[:120]
@@ -890,14 +1418,12 @@ class AUREXLive:
                 async def _do_shutdown():
                     await self._save_session_summary()
                     if self.session:
-                        try:
-                            await self.session.send_client_content(
-                                turns={"role": "user", "parts": [{"text": "Say a brief natural goodbye to the user."}]},
-                                turn_complete=True,
-                            )
-                        except Exception:
-                            pass
+                        await self._send_safely("Say a brief natural goodbye to the user.", tag="goodbye")
                     await asyncio.sleep(1.5)
+                    if self._camera is not None:
+                        self._camera.stop()   # release the physical device cleanly (item 8)
+                    if self._presence_detector is not None:
+                        self._presence_detector.stop()
                     import os as _os
                     _os._exit(0)
                 asyncio.create_task(_do_shutdown())
@@ -970,10 +1496,14 @@ class AUREXLive:
             # detector, which runs its model in ITS OWN thread — the cost here is
             # only a queue push, so the audio path is never slowed. When wake word
             # is off (default) or we're awake, this is a single boolean check.
-            if self._wake_enabled and not self._awake:
-                det = self._wake_detector
-                if det is not None:
-                    det.feed(indata)
+            if self._kiosk_mode and not self._awake:
+                if self._wake_enabled:
+                    det = self._wake_detector
+                    if det is not None:
+                        det.feed(indata)
+                # In presence-only mode there's nothing to feed audio to —
+                # the camera thread does its own thing — we just keep the
+                # mic gated (nothing streamed to Gemini) until it wakes us.
                 return
             with self._speaking_lock:
                 AUREX_speaking = self._is_speaking
@@ -985,14 +1515,23 @@ class AUREXLive:
                 # only via the ESC key / Interrupt button.
                 if self.ui.muted or self._phone_active:
                     return
+                now   = time.monotonic()
                 level = _pcm_level(indata)
-                if level >= _BARGE_IN_LEVEL:
+                if (now - self._speaking_since) < _BARGE_IN_GRACE:
+                    # First second of a reply: learn how loud our own voice is
+                    # inside the mic. Never interrupt during this window.
+                    self._echo_peak = max(self._echo_peak, level)
+                    self._barge_in_streak = 0
+                    return
+                thresh = min(0.95, max(_BARGE_IN_LEVEL, self._echo_peak * _BARGE_IN_MARGIN))
+                if level >= thresh:
                     self._barge_in_streak += 1
                 else:
                     self._barge_in_streak = 0
+                    self._echo_peak = max(level, self._echo_peak * 0.995)   # track echo drift
                 if self._barge_in_streak >= _BARGE_IN_FRAMES:
                     self._barge_in_streak = 0
-                    self.interrupt()   # stops playback + flips _is_speaking off
+                    self.interrupt("barge-in")   # thread-safe: runs on the asyncio loop
                     # Forward the chunk that triggered the barge-in too, so
                     # the first word the user said isn't lost.
                     data = indata.tobytes()
@@ -1001,6 +1540,9 @@ class AUREXLive:
                         {"data": data, "mime_type": "audio/pcm"}
                     )
                 return
+
+            if time.monotonic() < self._mic_hold_until:
+                return   # AUREX just stopped talking — don't send its speaker tail back to it
 
             if not self.ui.muted and not self._phone_active:
                 data = indata.tobytes()
@@ -1080,6 +1622,9 @@ class AUREXLive:
                             self._resume_handle = _sru.new_handle
 
                     if response.data:
+                        self._turn_open = True
+                        if self._interrupted and (time.monotonic() - self._interrupted_at) > _INTERRUPT_DISCARD_MAX:
+                            self._interrupted = False   # safety valve: a lost turn_complete must never mute AUREX for good
                         if self._interrupted:
                             pass  # discard: interrupted
                         else:
@@ -1095,6 +1640,17 @@ class AUREXLive:
                     if response.server_content:
                         sc = response.server_content
 
+                        if getattr(sc, "interrupted", False):
+                            # The SERVER cancelled its own turn (it heard the user).
+                            # Anything still queued is stale; everything that arrives
+                            # from now on belongs to the NEXT turn — so also disarm
+                            # our own discard flag or that next reply would be muted.
+                            self._stop_playback()
+                            self._interrupted = False
+                            self._turn_open = False
+                            self._expect_reply_until = 0.0
+                            out_buf = []
+
                         if sc.output_transcription and sc.output_transcription.text:
                             txt = _clean_transcript(sc.output_transcription.text)
                             if txt and txt != (out_buf[-1] if out_buf else ""):
@@ -1107,6 +1663,8 @@ class AUREXLive:
                                 self._last_user_speech = time.monotonic()
 
                         if sc.turn_complete:
+                            self._turn_open = False
+                            self._expect_reply_until = 0.0
                             if self._turn_done_event:
                                 self._turn_done_event.set()
 
@@ -1144,18 +1702,10 @@ class AUREXLive:
 
                             # Vision injection: model finished tool-response turn → now send the image
                             if self._pending_vision and self.session:
-                                import base64 as _b64
                                 img_b, mime_t, question, angle = self._pending_vision
                                 self._pending_vision = None
-                                b64 = _b64.b64encode(img_b).decode("ascii")
                                 print(f"[Vision] 📤 {len(img_b):,} bytes (angle={angle}) → main session")
-                                await self.session.send_client_content(
-                                    turns={"role": "user", "parts": [
-                                        {"inline_data": {"mime_type": mime_t, "data": b64}},
-                                        {"text": question},
-                                    ]},
-                                    turn_complete=True,
-                                )
+                                await self._send_to_model(question, image=img_b, mime=mime_t)
                                 # Mark next turn_complete behaviour depending on angle
                                 if self._vision_cam_active:
                                     # Camera: keep busy until AUREX finishes speaking the answer
@@ -1266,134 +1816,6 @@ class AUREXLive:
             stream.stop()
             stream.close()
 
-    # ── Morning briefing ────────────────────────────────────────────────────────
-
-    async def _send_startup_briefing(self) -> None:
-        """
-        Two-phase briefing optimized for speed:
-          Phase 1 — instant greeting (no tools) → speech starts in <1s
-          Phase 2 — news pre-fetched in a background thread while Phase 1 plays,
-                    delivered as ready text (no Gemini tool-call round-trip) and
-                    shown on the UI content panel. Waits for turn_complete event
-                    instead of a fixed sleep so there is no unnecessary gap.
-        """
-        memory   = load_memory()
-        identity = memory.get("identity", {})
-
-        def _val(k: str) -> str:
-            e = identity.get(k, {})
-            return (e.get("value", "") if isinstance(e, dict) else str(e)).strip()
-
-        lang = _val("language")
-        name = _val("name")
-        time_str = datetime.now().strftime("%H:%M")
-
-        # Start fetching news immediately — runs in parallel while phase 1 plays
-        loop = asyncio.get_event_loop()
-        news_future = loop.run_in_executor(None, _fetch_news_sync, "top world news today")
-
-        await asyncio.sleep(0.3)
-        if not self.session:
-            return
-
-        # ── Phase 1: instant greeting ─────────────────────────────────────────
-        # The briefing fires before the user has said anything, so the
-        # remembered language is the only signal there is. It is a starting
-        # point, not a setting: the moment they reply, their language wins.
-        lang_clause = (f" Speak this greeting in {lang}, then follow the "
-                       f"user's own language from their first reply onward."
-                       if lang else "")
-        name_clause = f" Address the user as {name}." if name else ""
-
-        # Inject last session context if available — pop removes it so it's never repeated
-        last = await asyncio.to_thread(pop_last_session)
-        session_clause = ""
-        if last:
-            try:
-                _delta = (datetime.now() - datetime.strptime(last["date"], "%Y-%m-%d")).days
-                _when  = "earlier today" if _delta == 0 else ("yesterday" if _delta == 1 else f"{_delta} days ago")
-            except Exception:
-                _when = "last time"
-            session_clause = (
-                f" Also briefly and naturally mention that {_when}: {last['summary']}"
-            )
-
-        p1 = (
-            f"Greet the user warmly, mention it is {time_str}, and say you are fetching today's news now.{session_clause} "
-            f"Keep it to 2 short sentences max. Do not call any tools.{lang_clause}{name_clause}"
-        )
-
-        # Clear the turn-done event so we can wait for Phase 1 to finish
-        if self._turn_done_event:
-            self._turn_done_event.clear()
-
-        await self.session.send_client_content(
-            turns={"role": "user", "parts": [{"text": p1}]},
-            turn_complete=True,
-        )
-        self.ui.write_log("SYS: Briefing phase 1 (greeting) sent.")
-
-        # ── Phase 2: fire as soon as Phase 1 audio is done ───────────────────
-        async def _deliver_news():
-            try:
-                lang_str = (f" Speak in {lang} unless the user has since "
-                            f"spoken another language, in which case use theirs."
-                            if lang else "")
-
-                # Wait for news fetch (already running) and Phase 1 turn-complete
-                # in parallel — whichever takes longer determines the wait time
-                news_done   = asyncio.wrap_future(news_future)
-                turn_waited = False
-                if self._turn_done_event:
-                    try:
-                        await asyncio.wait_for(self._turn_done_event.wait(), timeout=6.0)
-                        turn_waited = True
-                    except asyncio.TimeoutError:
-                        pass
-
-                # Extra buffer: turn_complete fires when Gemini finishes *generating*
-                # Phase 1, but audio may still be playing.  Waiting a beat here
-                # prevents Phase 2 audio from arriving while Phase 1 is mid-sentence
-                # (which sounds like a "repeated first response" to the user).
-                if turn_waited:
-                    await asyncio.sleep(0.8)
-                else:
-                    await asyncio.sleep(1.0)
-
-                try:
-                    news_text = await asyncio.wait_for(news_done, timeout=4.0)
-                except Exception:
-                    news_text = ""
-
-                if not self.session:
-                    return
-
-                if news_text and len(news_text) > 60:
-                    # Show on UI content panel immediately
-                    self.ui.show_content("NEWS — top world news today", news_text)
-
-                    p2 = (
-                        f"[BRIEFING] Here are today's top news headlines:\n{news_text}\n\n"
-                        "Pick ONE headline, summarise it in one sentence, then say the full list "
-                        f"is displayed on screen. Do not call any tools.{lang_str}"
-                    )
-                else:
-                    p2 = (
-                        "News headlines could not be fetched right now. "
-                        f"Let the user know briefly.{lang_str}"
-                    )
-
-                await self.session.send_client_content(
-                    turns={"role": "user", "parts": [{"text": p2}]},
-                    turn_complete=True,
-                )
-                self.ui.write_log("SYS: Briefing phase 2 (news) sent.")
-            except Exception as e:
-                print(f"[Briefing] Phase 2 error: {e}")
-                self.ui.write_log(f"SYS: Briefing phase 2 failed: {e}")
-
-        asyncio.create_task(_deliver_news())
-
     # ── Session memory ──────────────────────────────────────────────────────────
 
     async def _save_session_summary(self) -> None:
@@ -1427,102 +1849,6 @@ class AUREXLive:
                 save_session_summary(summary, lang)
         except Exception as e:
             print(f"[Memory] ⚠️ Session summary failed: {e}")
-
-    # ── System monitor ──────────────────────────────────────────────────────────
-
-    async def _run_system_monitor(self) -> None:
-        """Background task: voice alerts when metrics exceed thresholds."""
-        while True:
-            await asyncio.sleep(10)
-            alert = await asyncio.to_thread(self._sys_monitor.check)
-            if not alert or not self.session or not self._awake:
-                continue
-            # Don't interrupt an active conversation
-            with self._speaking_lock:
-                speaking = self._is_speaking
-            if speaking or (time.monotonic() - self._last_user_speech) < 10:
-                continue
-            try:
-                await self.session.send_client_content(
-                    turns={"role": "user", "parts": [{"text": alert}]},
-                    turn_complete=True,
-                )
-            except Exception as e:
-                print(f"[Monitor] ⚠️ Could not send alert: {e}")
-
-    # ── Background monitor ──────────────────────────────────────────────────────
-
-    async def _run_background_monitor(self) -> None:
-        """Check user-configured topics once per day; speak alerts when new headlines appear."""
-        await asyncio.sleep(300)          # wait 5 min after startup before first check
-        while True:
-            if self.session and self._awake:
-                # Don't interrupt if user spoke recently or AUREX is mid-sentence
-                with self._speaking_lock:
-                    speaking = self._is_speaking
-                recent_speech = (time.monotonic() - self._last_user_speech) < 30
-                if not speaking and not recent_speech:
-                    try:
-                        alerts = await asyncio.to_thread(monitor_check_all)
-                        memory = load_memory()
-                        lang_e = memory.get("identity", {}).get("language", {})
-                        lang   = (lang_e.get("value", "") if isinstance(lang_e, dict) else str(lang_e)).strip() or "English"
-                        for alert in alerts:
-                            msg = (
-                                f"{alert}\n\n"
-                                f"Inform the user about this development naturally in {lang}. "
-                                "One brief sentence only."
-                            )
-                            await self.session.send_client_content(
-                                turns={"role": "user", "parts": [{"text": msg}]},
-                                turn_complete=True,
-                            )
-                            self.ui.write_log(f"SYS: Monitor alert sent.")
-                            await asyncio.sleep(6)   # gap between consecutive alerts
-                    except Exception as e:
-                        print(f"[Monitor] ⚠️ Background check error: {e}")
-            await asyncio.sleep(1800)     # check every 30 minutes
-
-    # ── Proactive mode ──────────────────────────────────────────────────────────
-
-    async def _run_proactive_mode(self) -> None:
-        """
-        Background task: periodically checks if the user has been silent long enough,
-        then hands time + memory context to Gemini so it can decide what (if anything)
-        to say proactively. No hardcoded rules — Gemini makes the call.
-        """
-        while True:
-            await asyncio.sleep(60)   # evaluate once per minute
-
-            if not self.session or not self._awake:
-                continue
-
-            with self._speaking_lock:
-                speaking = self._is_speaking
-            if speaking:
-                continue
-
-            if not self._proactive.should_trigger(self._last_user_speech):
-                continue
-
-            self._proactive.mark_triggered()
-
-            try:
-                memory       = await asyncio.to_thread(load_memory)
-                monitors     = await asyncio.to_thread(list_monitors)
-                recent_turns = self._session_log[-8:] if self._session_log else []
-                prompt = self._proactive.build_prompt(
-                    memory       = memory,
-                    monitors     = monitors or None,
-                    recent_turns = recent_turns or None,
-                )
-                await self.session.send_client_content(
-                    turns={"role": "user", "parts": [{"text": prompt}]},
-                    turn_complete=True,
-                )
-                self.ui.write_log("SYS: Proactive check-in.")
-            except Exception as e:
-                print(f"[Proactive] ⚠️ {e}")
 
     # ── Phone audio relay ────────────────────────────────────────────────────────
 
@@ -1569,10 +1895,7 @@ class AUREXLive:
                     # has no desktop WAKE button — so it wakes AUREX if asleep.
                     if self._wake_enabled and not self._awake:
                         self.wake(reason="remote command")
-                    await self.session.send_client_content(
-                        turns={"role": "user", "parts": [{"text": text}]},
-                        turn_complete=True,
-                    )
+                    await self._send_to_model(text)
                     self.ui.write_log(f"[Web]: {text}")
                 else:
                     print(f"[Dashboard] Dropped command (no session): {text}")
@@ -1586,6 +1909,7 @@ class AUREXLive:
 
     async def run(self):
         self._loop = asyncio.get_event_loop()
+        self._loop_thread_id = threading.get_ident()
         self._reconnect_event = asyncio.Event()
 
         # ── Wire the shared core services to the interface ───────────────────
@@ -1620,6 +1944,26 @@ class AUREXLive:
             print(f"[Dashboard] Disabled: {e}")
             self._dashboard = None
 
+        # ── Kiosk bootstrap (item 12) ──────────────────────────────────────────
+        # CameraManager and the presence/wake sensors are independent of the
+        # Gemini connection — they start ONCE here, not inside the reconnect
+        # loop below, so a network hiccup never restarts the camera or
+        # re-triggers a greeting. Startup is silent: no greeting, no news,
+        # just IDLE and watching.
+        if self._camera is not None:
+            self._camera.start()
+        if self._wake_enabled:
+            self._ensure_wake_detector()
+        if self._presence_enabled:
+            self._ensure_presence_detector()
+
+        if self._kiosk_mode:
+            self._awake = False
+            self.ui.set_state("SLEEPING")
+        else:
+            self._awake = True
+            self.ui.set_state("LISTENING")
+
         while True:
             try:
                 print("[AUREX] Connecting...")
@@ -1651,6 +1995,8 @@ class AUREXLive:
                     self._vision_busy          = False
                     self._vision_last_time     = 0.0
                     self._interrupted          = False
+                    self._turn_open            = False
+                    self._expect_reply_until   = 0.0
 
                     print("[AUREX] Connected.")
                     if _resumed_with:
@@ -1658,17 +2004,14 @@ class AUREXLive:
                         # and "it reconnected and still knows what we were doing"
                         # is the whole point, and it is invisible otherwise.
                         self.ui.write_log("SYS: Reconnected — conversation restored.")
-
-                    # Wake word: if enabled, come up ASLEEP (mic gated, silent)
-                    # until the user says "Hey AUREX" or taps wake in the UI.
-                    if self._wake_enabled:
-                        self._ensure_wake_detector()
-                        self._awake = False
-                        self.ui.set_state("SLEEPING")
-                        self.ui.write_log("SYS: AUREX online — sleeping. Say 'Hey AUREX' to wake me.")
+                    elif self._kiosk_mode:
+                        _how = []
+                        if self._wake_enabled:
+                            _how.append("say 'Hey AUREX'")
+                        if self._presence_enabled:
+                            _how.append("walk up to the camera")
+                        self.ui.write_log(f"SYS: AUREX online — idle, silent. {' or '.join(_how).capitalize()} to begin.")
                     else:
-                        self._awake = True
-                        self.ui.set_state("LISTENING")
                         self.ui.write_log("SYS: AUREX online.")
 
                     if self._dashboard:
@@ -1680,19 +2023,11 @@ class AUREXLive:
                     tg.create_task(self._listen_audio())
                     tg.create_task(self._receive_audio())
                     tg.create_task(self._play_audio())
-                    tg.create_task(self._run_system_monitor())
-                    tg.create_task(self._run_background_monitor())
-                    tg.create_task(self._run_proactive_mode())
                     tg.create_task(self._run_sleep_watch())
+                    if self._greeting_pending:
+                        tg.create_task(self._deliver_pending_greeting())
                     if self._dashboard:
                         tg.create_task(self._relay_phone_audio())
-
-                    # Morning briefing — fires once per process launch (if enabled).
-                    # Skipped in wake-word mode: it comes up asleep, and a briefing
-                    # would mean talking while "asleep".
-                    if not self._briefing_sent and get_brief_enabled() and self._awake:
-                        self._briefing_sent = True
-                        tg.create_task(self._send_startup_briefing())
 
             except KeyboardInterrupt:
                 raise
@@ -1793,18 +2128,75 @@ class AUREXLive:
             await asyncio.sleep(delay)
 
 def main():
+    import os as _os
+    import signal as _signal
+
     ui = AUREXUI("face.png")
+    holder: dict = {"aurex": None, "stopping": False, "cleanup": None}
 
     def runner():
         ui.wait_for_api_key()
         AUREX = AUREXLive(ui)
+        holder["aurex"] = AUREX
         try:
             asyncio.run(AUREX.run())
         except KeyboardInterrupt:
             print("\n🔴 Shutting down...")
 
+    def _start_cleanup() -> threading.Thread:
+        """Release camera / sensors off the UI thread, exactly once."""
+        if holder["cleanup"] is None:
+            def _do():
+                a = holder["aurex"]
+                if a is not None:
+                    try:
+                        a.shutdown()
+                    except Exception as e:
+                        print(f"[AUREX] cleanup error: {e}")
+            t = threading.Thread(target=_do, daemon=True, name="CleanupThread")
+            holder["cleanup"] = t
+            t.start()
+        return holder["cleanup"]
+
+    def _quit(*_):
+        # First Ctrl+C: graceful. Second: immediate. A watchdog guarantees the
+        # process ends even if some worker thread (audio, network) is stuck.
+        if holder["stopping"]:
+            print("\n🔴 Forced exit.")
+            _os._exit(1)
+        holder["stopping"] = True
+        print("\n🔴 Shutting down... (Ctrl+C again to force)")
+        wd = threading.Timer(5.0, lambda: _os._exit(0))
+        wd.daemon = True
+        wd.start()
+        _start_cleanup()
+        try:
+            ui._app.quit()
+        except Exception:
+            _os._exit(0)
+
+    # Qt's event loop runs in C++ and never gives Python's signal handler a
+    # chance to run, which is why Ctrl+C in the terminal did nothing. The
+    # heartbeat timer below wakes the interpreter every 150 ms so it can.
+    for _name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        _sig = getattr(_signal, _name, None)
+        if _sig is not None:
+            try:
+                _signal.signal(_sig, _quit)
+            except (ValueError, OSError):
+                pass
+    from PyQt6.QtCore import QTimer
+    _heartbeat = QTimer()
+    _heartbeat.timeout.connect(lambda: None)
+    _heartbeat.start(150)
+
     threading.Thread(target=runner, daemon=True).start()
     ui.root.mainloop()
+
+    # Window closed (or _quit ran): finish cleanup, then leave for real —
+    # never wait on non-daemon executor threads.
+    _start_cleanup().join(timeout=3.5)
+    _os._exit(0)
 
 if __name__ == "__main__":
     main()
