@@ -121,6 +121,26 @@ def save_wake_word_enabled(enabled: bool) -> None:
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
 
 
+def get_presence_enabled() -> bool:
+    """Whether the ambient camera presence-sensor is on (greets whoever walks
+    up to the desk and lets the assistant go quiet again once they leave).
+    Defaults to True: this is the "always-on office kiosk" feature, so it
+    should work out of the box unless someone opts out."""
+    return load_api_keys().get("presence_enabled", True)
+
+
+def save_presence_enabled(enabled: bool) -> None:
+    ensure_config_dir()
+    data: dict = {}
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    data["presence_enabled"] = bool(enabled)
+    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
 def get_brief_enabled() -> bool:
     return load_api_keys().get("morning_brief_enabled", True)
 
