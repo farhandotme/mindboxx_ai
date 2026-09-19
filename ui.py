@@ -3589,34 +3589,26 @@ class MainWindow(QMainWindow):
         t.start()
 
     def _cam_loop(self) -> None:
+        """Feeds the on-screen camera preview from the ONE shared
+        CameraManager -- never opens its own cv2.VideoCapture. Two handles on
+        the same physical webcam index fight each other on most drivers
+        (that's the old "camera doesn't open reliably" bug), so this preview
+        is just another reader of the single background capture, same as
+        presence detection and vision snapshots. See
+        actions/screen_processor.get_shared_camera_manager() and the ABSOLUTE
+        RULE documented in core/camera_manager.py."""
         try:
             import cv2
-            # Reuse camera index detected by screen_processor (cached in api_keys.json)
-            cam_idx = 0
-            try:
-                import json as _j
-                cfg = _j.loads((CONFIG_DIR / "api_keys.json").read_text())
-                cam_idx = int(cfg.get("camera_index", 0))
-            except Exception:
-                pass
-            try:
-                backend = cv2.CAP_DSHOW if _OS == "Windows" else cv2.CAP_ANY
-            except AttributeError:
-                backend = 0
-            cap = cv2.VideoCapture(cam_idx, backend)
-            if not cap.isOpened():
-                cap = cv2.VideoCapture(0)
-            if not cap.isOpened():
+            from actions.screen_processor import get_shared_camera_manager
+            mgr = get_shared_camera_manager()
+            if mgr is None:
+                print("[Camera] Stream error: no shared camera manager -- always-on camera is off/unavailable.")
                 return
-            # warm-up frames
-            for _ in range(5):
-                cap.read()
-            while not self._cam_stop.wait(0.033) and cap.isOpened():
-                ret, frame = cap.read()
-                if ret and frame is not None:
+            while not self._cam_stop.wait(0.033):
+                frame = mgr.get_latest_frame(max_age=2.0)
+                if frame is not None:
                     _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
                     self._cam_frame_sig.emit(buf.tobytes())
-            cap.release()
         except Exception as e:
             print(f"[Camera] Stream error: {e}")
         finally:
