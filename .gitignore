@@ -48,3 +48,7 @@ desktop.ini
 logs/
 downloads/
 screenshots/
+
+# Downloaded MediaPipe presence-detection models (core/presence.py) -- fetched
+# once at first run, cached locally, not meant to be committed.
+/models/mediapipe/
